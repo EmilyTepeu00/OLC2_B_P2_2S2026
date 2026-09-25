@@ -58,6 +58,12 @@ class AnalizadorSemantico:
             self.linea_actual = self.lineas[id(nodo)]
             self.columna_actual = self.columnas.get(id(nodo))
         return self.linea_actual
+
+    def _normalizar_tipo(self, tipo):
+        # "[T; N]" llega del parser como la tupla ('array', T, N), donde T puede tambien otra tupla ('array', ...) para arreglos multidimensionales
+        if isinstance(tipo, tuple) and tipo[0] == 'array':
+            return f'[{self._normalizar_tipo(tipo[1])}]'
+        return tipo
     
     def analizar(self, ast, lineas=None, columnas=None):
         self.errores = []
@@ -115,8 +121,7 @@ class AnalizadorSemantico:
         # Registrar parametros como variables
         for nom_param, tipo_param in parametros:
             # El tipo "[T; N]" llega del parser como la tupla y se normaliza a "[T]" que usa el tipo INFERIDO de un arreglo literal
-            if isinstance(tipo_param, tuple) and tipo_param[0] == 'array':
-                tipo_param = f'[{tipo_param[1]}]'
+            tipo_param = self._normalizar_tipo(tipo_param)
             simbolo = Simbolo(nom_param, 'variable', tipo_param, True)
             simbolo.linea = linea_funcion
             ok, error = self.tabla_actual.agregar(nom_param, simbolo)
@@ -183,8 +188,7 @@ class AnalizadorSemantico:
         
         # El tipo declarado como "[T; N]" llega al parser como la tupla
         # El tipo inferido de un arreglo literal se calcula como el string "[T]"
-        if isinstance(tipo, tuple) and tipo[0] == 'array':
-            tipo = f'[{tipo[1]}]'
+        tipo = self._normalizar_tipo(tipo)
         
         # Si tiene valor, validar la expresion y obtener su tipo
         tipo_valor = None

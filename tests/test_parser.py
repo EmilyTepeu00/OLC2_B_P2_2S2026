@@ -24,7 +24,7 @@ fn main() {
 }
 """
 
-ast, errores, errores_lexicos, lineas = parsear(codigo)
+ast, errores, errores_lexicos, lineas, columnas = parsear(codigo)
 
 print("=== PRUEBA DEL PARSER ===\n")
 

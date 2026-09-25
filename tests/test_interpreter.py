@@ -32,7 +32,7 @@ fn main() {
 }
 """
 
-ast, errores_parseo, errores_lexicos, lineas = parsear(codigo)
+ast, errores_parseo, errores_lexicos, lineas, columnas = parsear(codigo)
 
 if errores_parseo:
     print("Errores de parseo:")
@@ -40,7 +40,7 @@ if errores_parseo:
         print(f"  {e['mensaje']}")
 else:
     analizador = AnalizadorSemantico()
-    errores = analizador.analizar(ast, lineas=lineas)
+    errores = analizador.analizar(ast, lineas=lineas, columnas=columnas)
     
     if errores:
         print("Errores semanticos:")
