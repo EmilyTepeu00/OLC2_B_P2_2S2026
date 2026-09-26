@@ -13,4 +13,6 @@ backend/parsetab.py
 *.out
 *.tab.py
 frontend/node_modules/
-frontend/dist/
+frontend/dist/*.o
+*.s
+*.o
