@@ -7,6 +7,14 @@ from backend.codegen import GeneradorCodigo
 
 codigo = """
 fn main() {
+    let x: i32 = 42;
+    println!(x);
+
+    let mut y = 7;
+    println!("{}", y);
+
+    y = 100;
+    println!(y);
 }
 """
 
@@ -78,9 +86,10 @@ if exito:
     print(f'Stdout: {resultado.stdout!r}')
     print(f'Stderr: {resultado.stderr!r}')
 
-    if resultado.returncode == 0:
-        print('\nOK: el pipeline completo (compilador propio -> ARM64 -> QEMU) funciona')
+    esperado = '42\n7\n100\n'
+    if resultado.stdout == esperado and resultado.returncode == 0:
+        print('\nOK: la salida coincide con lo esperado (42 / 7 / 100)')
     else:
-        print('\nATENCION: el binario corrio pero con codigo de salida distinto de 0')
+        print(f'\nATENCION: no coincide. Esperado: {esperado!r}')
 
 limpiar()

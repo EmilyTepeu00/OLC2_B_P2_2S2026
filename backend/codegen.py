@@ -1,7 +1,10 @@
 # --- GENERADOR DE CODIGO ARM64 (AArch64) ---
 # Recorre el mismo AST que ya usa interpreter.py, pero en vez de ejecutar cada nodo, emite las instrucciones de ensamblador equivalentes
 
+SYSCALL_WRITE = 64
 SYSCALL_EXIT = 93
+
+TAMANO_SLOT = 16  # bytes reservados por variable (simple sin empacar)
 
 
 class GeneradorCodigo:
@@ -10,21 +13,18 @@ class GeneradorCodigo:
         self.datos = []     # lineas que van dentro de .section .data
         self.errores = []
         self._contador_etiquetas = 0
-        self._contador_strings = 0
+        self._usa_imprimir_entero = False
 
     def nueva_etiqueta(self, prefijo='L'):
         self._contador_etiquetas += 1
-        return f'{prefijo}{self._contador_etiquetas}'
-
-    def nueva_etiqueta_string(self):
-        self._contador_strings += 1
-        return f'str{self._contador_strings}'
+        return f'.{prefijo}{self._contador_etiquetas}'
 
     def generar(self, ast):
-        """Punto de entrada. Devuelve (codigo_asm: str, errores: list)"""
+        """Punto de entrada. Devuelve (codigo_asm: str | None, errores: list)"""
         self.texto = []
         self.datos = []
         self.errores = []
+        self._usa_imprimir_entero = False
 
         programa = ast
         funciones = [d for d in programa[1] if d[0] == 'funcion']
@@ -43,14 +43,18 @@ class GeneradorCodigo:
 
         return self._ensamblar_archivo_final(), self.errores
 
+    # Ensamblado final del archivo .s
     def _ensamblar_archivo_final(self):
         lineas = []
 
         lineas.append('.section .data')
+        lineas.append('    .align 3')
+        if self._usa_imprimir_entero:
+            lineas.append('buffer_entero: .skip 24')
+            lineas.append('buffer_entero_fin:')
+            lineas.append('salto_de_linea: .ascii "\\n"')
         if self.datos:
             lineas.extend(self.datos)
-        else:
-            lineas.append('    # (sin literales de datos todavia)')
         lineas.append('')
 
         lineas.append('.section .text')
@@ -63,9 +67,73 @@ class GeneradorCodigo:
         lineas.append('    svc #0')
         lineas.append('')
         lineas.extend(self.texto)
+
+        if self._usa_imprimir_entero:
+            lineas.append(self._rutina_imprimir_entero())
+
         lineas.append('')
 
         return '\n'.join(lineas)
+
+    def _rutina_imprimir_entero(self):
+        # Entrada: x0 = valor entero (con signo) a imprimir
+        # Convierte a decimal ASCII en buffer_entero (construyendo del final al principio) y lo escribe a stdout + '\n'
+        return '\n'.join([
+            'imprimir_entero:',
+            '    stp x29, x30, [sp, -32]!',
+            '    mov x29, sp',
+            '    stp x19, x20, [sp, 16]',
+            '',
+            '    mov x19, x0',                  # x19 = valor original (para el signo)
+            '    mov x9, x0',                   # x9  = valor de trabajo
+            '    adr x10, buffer_entero_fin',   # x10 = cursor, se arranca al final
+            '    mov x11, #10',
+            '',
+            '    cbnz x9, .Limprimir_no_es_cero',
+            "    mov w12, #'0'",
+            '    strb w12, [x10, #-1]!',
+            '    b .Limprimir_fin_digitos',
+            '',
+            '.Limprimir_no_es_cero:',
+            '    cmp x9, #0',
+            '    bge .Limprimir_loop',
+            '    neg x9, x9',
+            '',
+            '.Limprimir_loop:',
+            '    cbz x9, .Limprimir_fin_digitos',
+            '    udiv x12, x9, x11',
+            '    msub x13, x12, x11, x9',
+            "    add x13, x13, #'0'",
+            '    strb w13, [x10, #-1]!',
+            '    mov x9, x12',
+            '    b .Limprimir_loop',
+            '',
+            '.Limprimir_fin_digitos:',
+            '    cmp x19, #0',
+            '    bge .Limprimir_calcular_len',
+            "    mov w12, #'-'",
+            '    strb w12, [x10, #-1]!',
+            '',
+            '.Limprimir_calcular_len:',
+            '    adr x14, buffer_entero_fin',
+            '    sub x2, x14, x10',
+            '    mov x1, x10',
+            '    mov x0, #1',
+            f'    mov x8, #{SYSCALL_WRITE}',
+            '    svc #0',
+            '',
+            '    adr x1, salto_de_linea',
+            '    mov x2, #1',
+            '    mov x0, #1',
+            f'    mov x8, #{SYSCALL_WRITE}',
+            '    svc #0',
+            '',
+            '    ldp x19, x20, [sp, 16]',
+            '    ldp x29, x30, [sp], 32',
+            '    ret',
+        ])
+
+    # --- FUNCIONES ---
 
     def _generar_funcion(self, nodo):
         # nodo = ('funcion', nombre, parametros, tipo_retorno, cuerpo)
@@ -77,14 +145,101 @@ class GeneradorCodigo:
         self.texto.append('    stp x29, x30, [sp, -16]!')
         self.texto.append('    mov x29, sp')
 
-        for sentencia in cuerpo:
-            self._generar_sentencia(sentencia)
+        variables, espacio = self._reservar_variables(cuerpo)
+        if espacio > 0:
+            self.texto.append(f'    sub sp, sp, #{espacio}')
 
+        contexto = {'variables': variables}
+        for sentencia in cuerpo:
+            self._generar_sentencia(sentencia, contexto)
+
+        if espacio > 0:
+            self.texto.append(f'    add sp, sp, #{espacio}')
         # Epilogo: restauramos y retornamos
         self.texto.append('    ldp x29, x30, [sp], 16')
         self.texto.append('    ret')
         self.texto.append('')
 
-    def _generar_sentencia(self, sentencia):
+    def _reservar_variables(self, cuerpo):
+        # Primera pasada: cada 'let' de nivel superior del cuerpo recibe un slot de TAMANO_SLOT bytes
+        variables = {}
+        offset = 0
+        for sentencia in cuerpo:
+            if sentencia[0] == 'let':
+                nombre_var = sentencia[1]
+                offset += TAMANO_SLOT
+                variables[nombre_var] = offset
+        return variables, offset
+
+    # --- SENTENCIAS ---
+
+    def _generar_sentencia(self, sentencia, contexto):
         tipo = sentencia[0]
-        self.texto.append(f'    # TODO: sentencia "{tipo}" aun no implementada')
+
+        if tipo == 'let':
+            self._generar_let(sentencia, contexto)
+        elif tipo == 'asignar':
+            self._generar_asignar(sentencia, contexto)
+        elif tipo == 'llamada':
+            self._generar_expresion(sentencia, contexto)
+        else:
+            self.texto.append(f'    # TODO: sentencia "{tipo}" aun no esta')
+
+    def _generar_let(self, nodo, contexto):
+        # nodo = ('let', nombre, tipo, valor, mutable)
+        nombre = nodo[1]
+        valor = nodo[3]
+
+        if valor is None:
+            # Sin valor inicial: se deja en 0
+            return
+
+        self._generar_expresion(valor, contexto)    # deja el valor en x0
+        offset = contexto['variables'][nombre]
+        self.texto.append(f'    str x0, [x29, #-{offset}]')
+
+    def _generar_asignar(self, nodo, contexto):
+        # nodo = ('asignar', nombre, valor)
+        nombre = nodo[1]
+        valor = nodo[2]
+
+        self._generar_expresion(valor, contexto)
+        offset = contexto['variables'][nombre]
+        self.texto.append(f'    str x0, [x29, #-{offset}]')
+
+    # --- EXPRESIONES (dejan el resultado en x0) ---
+
+    def _generar_expresion(self, nodo, contexto):
+        tipo = nodo[0]
+
+        if tipo == 'literal':
+            self.texto.append(f'    mov x0, #{nodo[1]}')
+        elif tipo == 'var':
+            nombre = nodo[1]
+            offset = contexto['variables'][nombre]
+            self.texto.append(f'    ldr x0, [x29, #-{offset}]')
+        elif tipo == 'llamada':
+            self._generar_llamada(nodo, contexto)
+        else:
+            self.texto.append(f'    # TODO: expresion "{tipo}" aun no esta')
+
+    def _generar_llamada(self, nodo, contexto):
+        nombre = nodo[1]
+        argumentos = nodo[2]
+
+        if nombre == 'println':
+            arg_valor = None
+            if len(argumentos) == 1:
+                arg_valor = argumentos[0]
+            elif len(argumentos) == 2 and argumentos[0][0] == 'string':
+                arg_valor = argumentos[1]
+
+            if arg_valor is None:
+                self.texto.append('    # TODO: forma de println! aun no esta')
+                return
+
+            self._generar_expresion(arg_valor, contexto)  # deja el valor en x0
+            self.texto.append('    bl imprimir_entero')
+            self._usa_imprimir_entero = True
+        else:
+            self.texto.append(f'    # TODO: llamada a "{nombre}" aun no esta')
