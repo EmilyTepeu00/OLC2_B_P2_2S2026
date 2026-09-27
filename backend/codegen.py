@@ -214,6 +214,8 @@ class GeneradorCodigo:
 
         if tipo == 'literal':
             self.texto.append(f'    mov x0, #{nodo[1]}')
+        elif tipo == 'bool':
+            self.texto.append(f'    mov x0, #{1 if nodo[1] else 0}')
         elif tipo == 'var':
             nombre = nodo[1]
             offset = contexto['variables'][nombre]
@@ -232,10 +234,24 @@ class GeneradorCodigo:
         derecha = nodo[3]
 
         operadores_aritmeticos = {'+', '-', '*', '/', '%'}
-        if op not in operadores_aritmeticos:
-            self.texto.append(f'    # operador "{op}"')
-            return
+        operadores_relacionales = {
+            '==': 'eq', '!=': 'ne',
+            '>': 'gt', '>=': 'ge',
+            '<': 'lt', '<=': 'le',
+        }
 
+        if op in operadores_aritmeticos:
+            self._generar_binop_aritmetico(op, izquierda, derecha, contexto)
+        elif op in operadores_relacionales:
+            self._generar_binop_relacional(operadores_relacionales[op], izquierda, derecha, contexto)
+        elif op == '&&':
+            self._generar_and(izquierda, derecha, contexto)
+        elif op == '||':
+            self._generar_or(izquierda, derecha, contexto)
+        else:
+            self.texto.append(f'    # operador "{op}"')
+
+    def _generar_binop_aritmetico(self, op, izquierda, derecha, contexto):
         self._generar_expresion(izquierda, contexto)    # x0 = izquierda
         self.texto.append('    str x0, [sp, -16]!')     # push izquierda
         self._generar_expresion(derecha, contexto)      # x0 = derecha
@@ -253,6 +269,43 @@ class GeneradorCodigo:
         elif op == '%':
             self.texto.append('    sdiv x2, x0, x1')
             self.texto.append('    msub x0, x2, x1, x0')
+
+    def _generar_binop_relacional(self, condicion, izquierda, derecha, contexto):
+        self._generar_expresion(izquierda, contexto)
+        self.texto.append('    str x0, [sp, -16]!')
+        self._generar_expresion(derecha, contexto)
+        self.texto.append('    mov x1, x0')
+        self.texto.append('    ldr x0, [sp], 16')
+        self.texto.append('    cmp x0, x1')
+        self.texto.append(f'    cset x0, {condicion}')
+
+    def _generar_and(self, izquierda, derecha, contexto):
+        # Corto-circuito: si izquierda es falso, no se evalua derecha
+        etiqueta_falso = self.nueva_etiqueta('and_falso')
+        etiqueta_fin = self.nueva_etiqueta('and_fin')
+
+        self._generar_expresion(izquierda, contexto)
+        self.texto.append('    cmp x0, #0')
+        self.texto.append(f'    beq {etiqueta_falso}')
+        self._generar_expresion(derecha, contexto)
+        self.texto.append(f'    b {etiqueta_fin}')
+        self.texto.append(f'{etiqueta_falso}:')
+        self.texto.append('    mov x0, #0')
+        self.texto.append(f'{etiqueta_fin}:')
+
+    def _generar_or(self, izquierda, derecha, contexto):
+        # Corto-circuito: si izquierda es verdadero, no se evalua derecha
+        etiqueta_verdadero = self.nueva_etiqueta('or_verdadero')
+        etiqueta_fin = self.nueva_etiqueta('or_fin')
+
+        self._generar_expresion(izquierda, contexto)
+        self.texto.append('    cmp x0, #0')
+        self.texto.append(f'   bne {etiqueta_verdadero}')
+        self._generar_expresion(derecha, contexto)
+        self.texto.append(f'   b {etiqueta_fin}')
+        self.texto.append(f'{etiqueta_verdadero}:')
+        self.texto.append('    mov x0, #1')
+        self.texto.append(f'{etiqueta_fin}:')
 
     def _generar_llamada(self, nodo, contexto):
         nombre = nodo[1]
