@@ -183,7 +183,7 @@ class GeneradorCodigo:
         elif tipo == 'llamada':
             self._generar_expresion(sentencia, contexto)
         else:
-            self.texto.append(f'    # TODO: sentencia "{tipo}" aun no esta')
+            self.texto.append(f'    # sentencia "{tipo}"')
 
     def _generar_let(self, nodo, contexto):
         # nodo = ('let', nombre, tipo, valor, mutable)
@@ -220,8 +220,39 @@ class GeneradorCodigo:
             self.texto.append(f'    ldr x0, [x29, #-{offset}]')
         elif tipo == 'llamada':
             self._generar_llamada(nodo, contexto)
+        elif tipo == 'binop':
+            self._generar_binop(nodo, contexto)
         else:
-            self.texto.append(f'    # TODO: expresion "{tipo}" aun no esta')
+            self.texto.append(f'    # expresion "{tipo}"')
+
+    def _generar_binop(self, nodo, contexto):
+        # nodo = ('binop', operador, izquierda, derecha)
+        op = nodo[1]
+        izquierda = nodo[2]
+        derecha = nodo[3]
+
+        operadores_aritmeticos = {'+', '-', '*', '/', '%'}
+        if op not in operadores_aritmeticos:
+            self.texto.append(f'    # operador "{op}"')
+            return
+
+        self._generar_expresion(izquierda, contexto)    # x0 = izquierda
+        self.texto.append('    str x0, [sp, -16]!')     # push izquierda
+        self._generar_expresion(derecha, contexto)      # x0 = derecha
+        self.texto.append('    mov x1, x0')             # x1 = derecha
+        self.texto.append('    ldr x0, [sp], 16')       # pop -> x0 = izquierda
+
+        if op == '+':
+            self.texto.append('    add x0, x0, x1')
+        elif op == '-':
+            self.texto.append('    sub x0, x0, x1')
+        elif op == '*':
+            self.texto.append('    mul x0, x0, x1')
+        elif op == '/':
+            self.texto.append('    sdiv x0, x0, x1')
+        elif op == '%':
+            self.texto.append('    sdiv x2, x0, x1')
+            self.texto.append('    msub x0, x2, x1, x0')
 
     def _generar_llamada(self, nodo, contexto):
         nombre = nodo[1]
@@ -238,7 +269,7 @@ class GeneradorCodigo:
                 self.texto.append('    # TODO: forma de println! aun no esta')
                 return
 
-            self._generar_expresion(arg_valor, contexto)  # deja el valor en x0
+            self._generar_expresion(arg_valor, contexto)    # deja el valor en x0
             self.texto.append('    bl imprimir_entero')
             self._usa_imprimir_entero = True
         else:
