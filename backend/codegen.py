@@ -14,6 +14,7 @@ class GeneradorCodigo:
         self.errores = []
         self._contador_etiquetas = 0
         self._usa_imprimir_entero = False
+        self._offsets_por_nodo = {}     # id(nodo 'let') -> offset unico en el stack frame
 
     def nueva_etiqueta(self, prefijo='L'):
         self._contador_etiquetas += 1
@@ -25,6 +26,7 @@ class GeneradorCodigo:
         self.datos = []
         self.errores = []
         self._usa_imprimir_entero = False
+        self._offsets_por_nodo = {}
 
         programa = ast
         funciones = [d for d in programa[1] if d[0] == 'funcion']
@@ -145,11 +147,11 @@ class GeneradorCodigo:
         self.texto.append('    stp x29, x30, [sp, -16]!')
         self.texto.append('    mov x29, sp')
 
-        variables, espacio = self._reservar_variables(cuerpo)
+        espacio = self._reservar_variables(cuerpo)
         if espacio > 0:
             self.texto.append(f'    sub sp, sp, #{espacio}')
 
-        contexto = {'variables': variables}
+        contexto = {'scopes': [{}]}
         for sentencia in cuerpo:
             self._generar_sentencia(sentencia, contexto)
 
@@ -161,28 +163,48 @@ class GeneradorCodigo:
         self.texto.append('')
 
     def _reservar_variables(self, cuerpo):
-        # Recorre el cuerpo completo, incluyendo dentro de if/while para que cualquier 'let' anidado tambien reciba su slot
-        variables = {}
+        # Cada 'let' del cuerpo recibe su propio slot, identificado por el nodo
+        # Asi dos variables con el mismo nombre en bloques distintos nunca comparten memoria
         offset = [0]
-        self._recolectar_lets(cuerpo, variables, offset)
-        return variables, offset[0]
+        self._recolectar_lets(cuerpo, offset)
+        return offset[0]
 
-    def _recolectar_lets(self, sentencias, variables, offset):
+    def _recolectar_lets(self, sentencias, offset):
         for sentencia in sentencias:
             tipo = sentencia[0]
             if tipo == 'let':
                 offset[0] += TAMANO_SLOT
-                variables[sentencia[1]] = offset[0]
+                self._offsets_por_nodo[id(sentencia)] = offset[0]
             elif tipo == 'if':
-                self._recolectar_lets(sentencia[2], variables, offset)
+                self._recolectar_lets(sentencia[2], offset)
                 cuerpo_else = sentencia[3]
                 if cuerpo_else is not None:
                     if cuerpo_else[0] == 'if':
-                        self._recolectar_lets([cuerpo_else], variables, offset)
+                        self._recolectar_lets([cuerpo_else], offset)
                     else:
-                        self._recolectar_lets(cuerpo_else, variables, offset)
+                        self._recolectar_lets(cuerpo_else, offset)
             elif tipo == 'while':
-                self._recolectar_lets(sentencia[2], variables, offset)
+                self._recolectar_lets(sentencia[2], offset)
+
+    # --- SCOPES ---
+
+    def _abrir_scope(self, contexto):
+        contexto['scopes'].append({})
+
+    def _cerrar_scope(self, contexto):
+        contexto['scopes'].pop()
+
+    def _declarar_variable(self, nodo_let, contexto):
+        offset = self._offsets_por_nodo[id(nodo_let)]
+        contexto['scopes'][-1][nodo_let[1]] = offset
+        return offset
+
+    def _buscar_variable(self, nombre, contexto):
+        # Del bloque mas interno hacia el mas externo
+        for scope in reversed(contexto['scopes']):
+            if nombre in scope:
+                return scope[nombre]
+        raise KeyError(f'variable "{nombre}" sin declarar en el codegen')
 
     # --- SENTENCIAS ---
 
@@ -212,16 +234,20 @@ class GeneradorCodigo:
         self._generar_expresion(condicion, contexto)
         self.texto.append('    cmp x0, #0')
         self.texto.append(f'    beq {etiqueta_else}')
+        self._abrir_scope(contexto)
         for sent in cuerpo_then:
             self._generar_sentencia(sent, contexto)
+        self._cerrar_scope(contexto)
         self.texto.append(f'    b {etiqueta_fin}')
         self.texto.append(f'{etiqueta_else}:')
         if cuerpo_else is not None:
             if cuerpo_else[0] == 'if':
                 self._generar_if(cuerpo_else, contexto)
             else:
+                self._abrir_scope(contexto)
                 for sent in cuerpo_else:
                     self._generar_sentencia(sent, contexto)
+                self._cerrar_scope(contexto)
         self.texto.append(f'{etiqueta_fin}:')
 
     def _generar_let(self, nodo, contexto):
@@ -231,10 +257,13 @@ class GeneradorCodigo:
 
         if valor is None:
             # Sin valor inicial: se deja en 0
+            offset = self._declarar_variable(nodo, contexto)
+            self.texto.append(f'    str xzr, [x29, #-{offset}]')
             return
 
+        # El valor se evalua antes de declarar el nombre (let x = x + 1 usa el x anterior)
         self._generar_expresion(valor, contexto)    # deja el valor en x0
-        offset = contexto['variables'][nombre]
+        offset = self._declarar_variable(nodo, contexto)
         self.texto.append(f'    str x0, [x29, #-{offset}]')
 
     def _generar_asignar(self, nodo, contexto):
@@ -243,7 +272,7 @@ class GeneradorCodigo:
         valor = nodo[2]
 
         self._generar_expresion(valor, contexto)
-        offset = contexto['variables'][nombre]
+        offset = self._buscar_variable(nombre, contexto)
         self.texto.append(f'    str x0, [x29, #-{offset}]')
 
     # --- EXPRESIONES (dejan el resultado en x0) ---
@@ -257,7 +286,7 @@ class GeneradorCodigo:
             self.texto.append(f'    mov x0, #{1 if nodo[1] else 0}')
         elif tipo == 'var':
             nombre = nodo[1]
-            offset = contexto['variables'][nombre]
+            offset = self._buscar_variable(nombre, contexto)
             self.texto.append(f'    ldr x0, [x29, #-{offset}]')
         elif tipo == 'llamada':
             self._generar_llamada(nodo, contexto)
