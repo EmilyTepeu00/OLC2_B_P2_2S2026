@@ -148,15 +148,13 @@ class GeneradorCodigo:
         self.texto.append('    mov x29, sp')
 
         espacio = self._reservar_variables(cuerpo)
-        if espacio > 0:
-            self.texto.append(f'    sub sp, sp, #{espacio}')
+        self._ajustar_sp('sub', espacio)
 
         contexto = {'scopes': [{}], 'bucles': []}
         for sentencia in cuerpo:
             self._generar_sentencia(sentencia, contexto)
 
-        if espacio > 0:
-            self.texto.append(f'    add sp, sp, #{espacio}')
+        self._ajustar_sp('add', espacio)
         # Epilogo: restauramos y retornamos
         self.texto.append('    ldp x29, x30, [sp], 16')
         self.texto.append('    ret')
@@ -187,6 +185,34 @@ class GeneradorCodigo:
                 self._recolectar_lets(sentencia[2], offset)
             elif tipo == 'loop':
                 self._recolectar_lets(sentencia[2], offset)
+
+    # --- ACCESO A VARIABLES Y STACK ---
+    # ldr/str con offset negativo respecto a x29 solo admite hasta -256, para variables mas lejanas se calcula la direccion en x16
+
+    def _direccion_variable(self, offset):
+        if offset <= 255:
+            return f'[x29, #-{offset}]'
+        self.texto.append(f'    mov x16, #{offset}')
+        self.texto.append('    sub x16, x29, x16')
+        return '[x16]'
+
+    def _cargar_variable(self, registro, offset):
+        direccion = self._direccion_variable(offset)
+        self.texto.append(f'    ldr {registro}, {direccion}')
+
+    def _guardar_variable(self, registro, offset):
+        direccion = self._direccion_variable(offset)
+        self.texto.append(f'    str {registro}, {direccion}')
+
+    def _ajustar_sp(self, operacion, bytes_):
+        # 'sub' (reservar) o 'add' (liberar), el inmediato de add/sub llega hasta 4095, por encima se usa un registro
+        if bytes_ <= 0:
+            return
+        if bytes_ <= 4095:
+            self.texto.append(f'    {operacion} sp, sp, #{bytes_}')
+        else:
+            self.texto.append(f'    mov x16, #{bytes_}')
+            self.texto.append(f'    {operacion} sp, sp, x16')
 
     # --- SCOPES ---
 
@@ -337,13 +363,13 @@ class GeneradorCodigo:
         if valor is None:
             # Sin valor inicial: se deja en 0
             offset = self._declarar_variable(nodo, contexto)
-            self.texto.append(f'    str xzr, [x29, #-{offset}]')
+            self._guardar_variable('xzr', offset)
             return
 
         # El valor se evalua antes de declarar el nombre (let x = x + 1 usa el x anterior)
         self._generar_expresion(valor, contexto)    # deja el valor en x0
         offset = self._declarar_variable(nodo, contexto)
-        self.texto.append(f'    str x0, [x29, #-{offset}]')
+        self._guardar_variable('x0', offset)
 
     def _generar_asignar(self, nodo, contexto):
         # nodo = ('asignar', nombre, valor)
@@ -352,7 +378,7 @@ class GeneradorCodigo:
 
         self._generar_expresion(valor, contexto)
         offset = self._buscar_variable(nombre, contexto)
-        self.texto.append(f'    str x0, [x29, #-{offset}]')
+        self._guardar_variable('x0', offset)
 
     # --- EXPRESIONES (dejan el resultado en x0) ---
 
@@ -366,7 +392,7 @@ class GeneradorCodigo:
         elif tipo == 'var':
             nombre = nodo[1]
             offset = self._buscar_variable(nombre, contexto)
-            self.texto.append(f'    ldr x0, [x29, #-{offset}]')
+            self._cargar_variable('x0', offset)
         elif tipo == 'llamada':
             self._generar_llamada(nodo, contexto)
         elif tipo == 'binop':
