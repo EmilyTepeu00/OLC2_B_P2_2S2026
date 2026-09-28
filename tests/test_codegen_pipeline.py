@@ -39,6 +39,17 @@ fn main() {
     g *= 2;
     g -= 3;
     println!(g);
+
+    let x = 10;
+    if x > 5 {
+        let y = 1;
+        println!(y);
+    } else if x > 20 {
+        println!(2);
+    } else {
+        println!(3);
+    }
+    println!(x);
 }
 """
 
@@ -110,7 +121,7 @@ if exito:
     print(f'Stdout: {resultado.stdout!r}')
     print(f'Stderr: {resultado.stderr!r}')
 
-    esperado = '42\n7\n100\n11\n3\n2\n1\n0\n1\n27\n'
+    esperado = '42\n7\n100\n11\n3\n2\n1\n0\n1\n27\n1\n10\n'
     if resultado.stdout == esperado and resultado.returncode == 0:
         print('\nOK: la salida coincide con lo esperado (42 / 7 / 100)')
     else:

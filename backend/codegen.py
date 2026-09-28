@@ -161,15 +161,28 @@ class GeneradorCodigo:
         self.texto.append('')
 
     def _reservar_variables(self, cuerpo):
-        # Primera pasada: cada 'let' de nivel superior del cuerpo recibe un slot de TAMANO_SLOT bytes
+        # Recorre el cuerpo completo, incluyendo dentro de if/while para que cualquier 'let' anidado tambien reciba su slot
         variables = {}
-        offset = 0
-        for sentencia in cuerpo:
-            if sentencia[0] == 'let':
-                nombre_var = sentencia[1]
-                offset += TAMANO_SLOT
-                variables[nombre_var] = offset
-        return variables, offset
+        offset = [0]
+        self._recolectar_lets(cuerpo, variables, offset)
+        return variables, offset[0]
+
+    def _recolectar_lets(self, sentencias, variables, offset):
+        for sentencia in sentencias:
+            tipo = sentencia[0]
+            if tipo == 'let':
+                offset[0] += TAMANO_SLOT
+                variables[sentencia[1]] = offset[0]
+            elif tipo == 'if':
+                self._recolectar_lets(sentencia[2], variables, offset)
+                cuerpo_else = sentencia[3]
+                if cuerpo_else is not None:
+                    if cuerpo_else[0] == 'if':
+                        self._recolectar_lets([cuerpo_else], variables, offset)
+                    else:
+                        self._recolectar_lets(cuerpo_else, variables, offset)
+            elif tipo == 'while':
+                self._recolectar_lets(sentencia[2], variables, offset)
 
     # --- SENTENCIAS ---
 
@@ -182,8 +195,34 @@ class GeneradorCodigo:
             self._generar_asignar(sentencia, contexto)
         elif tipo == 'llamada':
             self._generar_expresion(sentencia, contexto)
+        elif tipo == 'if':
+            self._generar_if(sentencia, contexto)
         else:
             self.texto.append(f'    # sentencia "{tipo}"')
+
+    def _generar_if(self, nodo, contexto):
+        # nodo = ('if', condicion, cuerpo_then, cuerpo_else), cuerpo_else puede ser: None una lista de sentencias o un nodo ('if', ...) suelto
+        condicion = nodo[1]
+        cuerpo_then = nodo[2]
+        cuerpo_else = nodo[3]
+
+        etiqueta_else = self.nueva_etiqueta('if_else')
+        etiqueta_fin = self.nueva_etiqueta('if_fin')
+
+        self._generar_expresion(condicion, contexto)
+        self.texto.append('    cmp x0, #0')
+        self.texto.append(f'    beq {etiqueta_else}')
+        for sent in cuerpo_then:
+            self._generar_sentencia(sent, contexto)
+        self.texto.append(f'    b {etiqueta_fin}')
+        self.texto.append(f'{etiqueta_else}:')
+        if cuerpo_else is not None:
+            if cuerpo_else[0] == 'if':
+                self._generar_if(cuerpo_else, contexto)
+            else:
+                for sent in cuerpo_else:
+                    self._generar_sentencia(sent, contexto)
+        self.texto.append(f'{etiqueta_fin}:')
 
     def _generar_let(self, nodo, contexto):
         # nodo = ('let', nombre, tipo, valor, mutable)
