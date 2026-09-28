@@ -64,6 +64,55 @@ fn main() {
 
     let z: i32;
     println!(z);
+
+    let mut i = 0;
+    while i < 3 {
+        println!(i);
+        i += 1;
+    }
+
+    let mut n = 0;
+    loop {
+        n += 1;
+        if n == 2 {
+            continue;
+        }
+        if n > 4 {
+            break;
+        }
+        println!(n);
+    }
+
+    let mut a1 = 0;
+    'outer: loop {
+        let mut b1 = 0;
+        loop {
+            b1 += 1;
+            a1 += 1;
+            if b1 == 2 {
+                break 'outer;
+            }
+        }
+    }
+    println!(a1);
+
+    let mut c1 = 0;
+    let mut total = 0;
+    'o2: loop {
+        c1 += 1;
+        if c1 > 3 {
+            break;
+        }
+        let mut d1 = 0;
+        loop {
+            d1 += 1;
+            if d1 > 2 {
+                continue 'o2;
+            }
+            total += 1;
+        }
+    }
+    println!(total);
 }
 """
 
@@ -135,7 +184,7 @@ if exito:
     print(f'Stdout: {resultado.stdout!r}')
     print(f'Stderr: {resultado.stderr!r}')
 
-    esperado = '42\n7\n100\n11\n3\n2\n1\n0\n1\n27\n1\n10\n2\n1\n6\n0\n'
+    esperado = '42\n7\n100\n11\n3\n2\n1\n0\n1\n27\n1\n10\n2\n1\n6\n0\n0\n1\n2\n1\n3\n4\n2\n6\n'
     if resultado.stdout == esperado and resultado.returncode == 0:
         print('\nOK: la salida coincide con lo esperado (42 / 7 / 100)')
     else:

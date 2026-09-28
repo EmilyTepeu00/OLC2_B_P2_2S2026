@@ -151,7 +151,7 @@ class GeneradorCodigo:
         if espacio > 0:
             self.texto.append(f'    sub sp, sp, #{espacio}')
 
-        contexto = {'scopes': [{}]}
+        contexto = {'scopes': [{}], 'bucles': []}
         for sentencia in cuerpo:
             self._generar_sentencia(sentencia, contexto)
 
@@ -184,6 +184,8 @@ class GeneradorCodigo:
                     else:
                         self._recolectar_lets(cuerpo_else, offset)
             elif tipo == 'while':
+                self._recolectar_lets(sentencia[2], offset)
+            elif tipo == 'loop':
                 self._recolectar_lets(sentencia[2], offset)
 
     # --- SCOPES ---
@@ -219,6 +221,14 @@ class GeneradorCodigo:
             self._generar_expresion(sentencia, contexto)
         elif tipo == 'if':
             self._generar_if(sentencia, contexto)
+        elif tipo == 'while':
+            self._generar_while(sentencia, contexto)
+        elif tipo == 'loop':
+            self._generar_loop(sentencia, contexto)
+        elif tipo == 'break':
+            self._generar_break(sentencia, contexto)
+        elif tipo == 'continue':
+            self._generar_continue(sentencia, contexto)
         else:
             self.texto.append(f'    # sentencia "{tipo}"')
 
@@ -249,6 +259,75 @@ class GeneradorCodigo:
                     self._generar_sentencia(sent, contexto)
                 self._cerrar_scope(contexto)
         self.texto.append(f'{etiqueta_fin}:')
+
+    # --- BUCLES ---
+
+    def _generar_while(self, nodo, contexto):
+        # nodo = ('while', condicion, cuerpo)
+        condicion = nodo[1]
+        cuerpo = nodo[2]
+
+        etiqueta_inicio = self.nueva_etiqueta('while_inicio')
+        etiqueta_fin = self.nueva_etiqueta('while_fin')
+
+        self.texto.append(f'{etiqueta_inicio}:')
+        self._generar_expresion(condicion, contexto)
+        self.texto.append('     cmp x0, #0')
+        self.texto.append(f'    beq {etiqueta_fin}')
+
+        contexto['bucles'].append({'etiqueta': None, 'inicio': etiqueta_inicio, 'fin': etiqueta_fin})
+        self._abrir_scope(contexto)
+        for sent in cuerpo:
+            self._generar_sentencia(sent, contexto)
+        self._cerrar_scope(contexto)
+        contexto['bucles'].pop()
+
+        self.texto.append(f'    b {etiqueta_inicio}')
+        self.texto.append(f'{etiqueta_fin}:')
+
+    def _generar_loop(self, nodo, contexto):
+        # nodo = ('loop', etiqueta | None, cuerpo)
+        etiqueta = nodo[1]
+        cuerpo = nodo[2]
+
+        etiqueta_inicio = self.nueva_etiqueta('loop_inicio')
+        etiqueta_fin = self.nueva_etiqueta('loop_fin')
+
+        self.texto.append(f'{etiqueta_inicio}:')
+
+        contexto['bucles'].append({'etiqueta': etiqueta, 'inicio': etiqueta_inicio, 'fin': etiqueta_fin})
+        self._abrir_scope(contexto)
+        for sent in cuerpo:
+            self._generar_sentencia(sent, contexto)
+        self._cerrar_scope(contexto)
+        contexto['bucles'].pop()
+
+        self.texto.append(f'    b {etiqueta_inicio}')
+        self.texto.append(f'{etiqueta_fin}:')
+
+    def _buscar_bucle(self, etiqueta, contexto):
+        # Sin etiqueta: el bucle mas interno
+        # Con etiqueta: el que la tenga
+        for bucle in reversed(contexto['bucles']):
+            if etiqueta is None or bucle['etiqueta'] == etiqueta:
+                return bucle
+        return None
+
+    def _generar_break(self, nodo, contexto):
+        bucle = self._buscar_bucle(nodo[1], contexto)
+        if bucle is None:
+            self.errores.append({'tipo': 'Semantico', 'linea': 0,
+                                 'mensaje': 'break fuera de un bucle o con etiqueta inexistente'})
+            return
+        self.texto.append(f'    b {bucle["fin"]}')
+
+    def _generar_continue(self, nodo, contexto):
+        bucle = self._buscar_bucle(nodo[1], contexto)
+        if bucle is None:
+            self.errores.append({'tipo': 'Semantico', 'linea': 0,
+                                 'mensaje': 'continue fuera de un bucle o con etiqueta inexistente'})
+            return
+        self.texto.append(f'    b {bucle["inicio"]}')
 
     def _generar_let(self, nodo, contexto):
         # nodo = ('let', nombre, tipo, valor, mutable)
