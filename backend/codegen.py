@@ -137,9 +137,12 @@ class GeneradorCodigo:
 
     # --- FUNCIONES ---
 
+    REGISTROS_PARAMETRO = ['x0', 'x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7']
+
     def _generar_funcion(self, nodo):
         # nodo = ('funcion', nombre, parametros, tipo_retorno, cuerpo)
         nombre = nodo[1]
+        parametros = nodo[2]
         cuerpo = nodo[4]
 
         self.texto.append(f'{nombre}:')
@@ -147,23 +150,38 @@ class GeneradorCodigo:
         self.texto.append('    stp x29, x30, [sp, -16]!')
         self.texto.append('    mov x29, sp')
 
-        espacio = self._reservar_variables(cuerpo)
+        espacio = self._reservar_variables(cuerpo, parametros)
         self._ajustar_sp('sub', espacio)
 
-        contexto = {'scopes': [{}], 'bucles': []}
+        contexto = {'scopes': [{}], 'bucles': [], 'etiqueta_fin_funcion': self.nueva_etiqueta('fin_funcion')}
+
+        # Los primeros 8 parametros llegan en x0-x7 y se copian a su slot en el stack antes de generar el cuerpo 
+        # para que el resto del codigo lo trate igual que cualquier otra variable
+        for i, parametro in enumerate(parametros):
+            offset = self._offsets_por_nodo[id(parametro)]
+            contexto['scopes'][0][parametro[0]] = offset
+            if i < len(self.REGISTROS_PARAMETRO):
+                self._guardar_variable(self.REGISTROS_PARAMETRO[i], offset)
+            else:
+                self.texto.append(f'    # parametro "{parametro[0]}": mas de 8 parametros no soportado')
+
         for sentencia in cuerpo:
             self._generar_sentencia(sentencia, contexto)
 
+        self.texto.append(f'{contexto["etiqueta_fin_funcion"]}:')
         self._ajustar_sp('add', espacio)
         # Epilogo: restauramos y retornamos
         self.texto.append('    ldp x29, x30, [sp], 16')
         self.texto.append('    ret')
         self.texto.append('')
 
-    def _reservar_variables(self, cuerpo):
-        # Cada 'let' del cuerpo recibe su propio slot, identificado por el nodo
+    def _reservar_variables(self, cuerpo, parametros=()):
+        # Cada parametro y cada 'let' del cuerpo recibe su propio slot, identificado por el nodo
         # Asi dos variables con el mismo nombre en bloques distintos nunca comparten memoria
         offset = [0]
+        for parametro in parametros:
+            offset[0] += TAMANO_SLOT
+            self._offsets_por_nodo[id(parametro)] = offset[0]
         self._recolectar_lets(cuerpo, offset)
         return offset[0]
 
@@ -257,6 +275,8 @@ class GeneradorCodigo:
             self._generar_continue(sentencia, contexto)
         elif tipo == 'match':
             self._generar_match(sentencia, contexto)
+        elif tipo == 'return':
+            self._generar_return(sentencia, contexto)
         else:
             self.texto.append(f'    # sentencia "{tipo}"')
 
@@ -387,6 +407,13 @@ class GeneradorCodigo:
                                  'mensaje': 'continue fuera de un bucle o con etiqueta inexistente'})
             return
         self.texto.append(f'    b {bucle["inicio"]}')
+
+    def _generar_return(self, nodo, contexto):
+        # nodo = ('return', valor | None)
+        valor = nodo[1]
+        if valor is not None:
+            self._generar_expresion(valor, contexto)
+        self.texto.append(f'    b {contexto["etiqueta_fin_funcion"]}')
 
     def _generar_let(self, nodo, contexto):
         # nodo = ('let', nombre, tipo, valor, mutable)
@@ -532,4 +559,18 @@ class GeneradorCodigo:
             self.texto.append('    bl imprimir_entero')
             self._usa_imprimir_entero = True
         else:
-            self.texto.append(f'    # TODO: llamada a "{nombre}" aun no esta')
+            self._generar_llamada_usuario(nombre, argumentos, contexto)
+
+    def _generar_llamada_usuario(self, nombre, argumentos, contexto):
+        # Cada argumento se evalua y se guarda en el stack de inmediato y al final se sacan en orden inverso para dejarlos en x0, x1, x2...
+        for argumento in argumentos:
+            self._generar_expresion(argumento, contexto)
+            self.texto.append('    str x0, [sp, -16]!')
+
+        for i in reversed(range(len(argumentos))):
+            if i < len(self.REGISTROS_PARAMETRO):
+                self.texto.append(f'    ldr {self.REGISTROS_PARAMETRO[i]}, [sp], 16')
+            else:
+                self.texto.append('    add sp, sp, #16')
+
+        self.texto.append(f'    bl {nombre}')
