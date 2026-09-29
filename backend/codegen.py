@@ -255,6 +255,8 @@ class GeneradorCodigo:
             self._generar_break(sentencia, contexto)
         elif tipo == 'continue':
             self._generar_continue(sentencia, contexto)
+        elif tipo == 'match':
+            self._generar_match(sentencia, contexto)
         else:
             self.texto.append(f'    # sentencia "{tipo}"')
 
@@ -284,6 +286,37 @@ class GeneradorCodigo:
                 for sent in cuerpo_else:
                     self._generar_sentencia(sent, contexto)
                 self._cerrar_scope(contexto)
+        self.texto.append(f'{etiqueta_fin}:')
+
+    def _generar_match(self, nodo, contexto):
+        # nodo = ('match', expresion, [('caso', patron, cuerpo), ...]) patron es un entero y el string 'default' para el comodin "_" cuerpo es una lista de sentencias 
+        expresion = nodo[1]
+        casos = nodo[2]
+        etiqueta_fin = self.nueva_etiqueta('match_fin')
+
+        self._generar_expresion(expresion, contexto)
+        self.texto.append('    str x0, [sp, -16]!')
+
+        for caso in casos:
+            patron = caso[1]
+            cuerpo = caso[2]
+            etiqueta_siguiente = self.nueva_etiqueta('match_caso')
+
+            if patron != 'default':
+                self.texto.append('    ldr x0, [sp]')
+                self.texto.append(f'    cmp x0, #{patron}')
+                self.texto.append(f'    bne {etiqueta_siguiente}')
+
+            self.texto.append('    add sp, sp, #16')
+            self._abrir_scope(contexto)
+            for sent in cuerpo:
+                self._generar_sentencia(sent, contexto)
+            self._cerrar_scope(contexto)
+            self.texto.append(f'    b {etiqueta_fin}')
+            self.texto.append(f'{etiqueta_siguiente}:')
+
+        # Ningun caso coincidio (no habia comodin): liberar el valor guardado
+        self.texto.append('    add sp, sp, #16')
         self.texto.append(f'{etiqueta_fin}:')
 
     # --- BUCLES ---
