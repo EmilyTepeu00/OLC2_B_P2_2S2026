@@ -15,6 +15,7 @@ class GeneradorCodigo:
         self._contador_etiquetas = 0
         self._usa_imprimir_entero = False
         self._offsets_por_nodo = {}     # id(nodo 'let') -> offset unico en el stack frame
+        self._longitudes_por_nodo = {}  # id(nodo 'let') -> cantidad de elementos, solo arreglos
 
     def nueva_etiqueta(self, prefijo='L'):
         self._contador_etiquetas += 1
@@ -27,6 +28,7 @@ class GeneradorCodigo:
         self.errores = []
         self._usa_imprimir_entero = False
         self._offsets_por_nodo = {}
+        self._longitudes_por_nodo = {}
 
         programa = ast
         funciones = [d for d in programa[1] if d[0] == 'funcion']
@@ -159,7 +161,7 @@ class GeneradorCodigo:
         # para que el resto del codigo lo trate igual que cualquier otra variable
         for i, parametro in enumerate(parametros):
             offset = self._offsets_por_nodo[id(parametro)]
-            contexto['scopes'][0][parametro[0]] = offset
+            contexto['scopes'][0][parametro[0]] = {'offset': offset, 'longitud': None}
             if i < len(self.REGISTROS_PARAMETRO):
                 self._guardar_variable(self.REGISTROS_PARAMETRO[i], offset)
             else:
@@ -185,12 +187,35 @@ class GeneradorCodigo:
         self._recolectar_lets(cuerpo, offset)
         return offset[0]
 
+    def _longitud_arreglo_1d(self, valor):
+        # Longitud si 'valor' es un arreglo unidimensional (literal o [v; N])
+        # None si no es arreglo, o si es multidimensional
+        if valor is None:
+            return None
+        if valor[0] == 'array_literal':
+            elementos = valor[1]
+            if elementos and elementos[0][0] in ('array_literal', 'array_repeat'):
+                return None
+            return len(elementos)
+        if valor[0] == 'array_repeat':
+            if valor[1][0] in ('array_literal', 'array_repeat'):
+                return None
+            return valor[2]
+        return None
+
     def _recolectar_lets(self, sentencias, offset):
         for sentencia in sentencias:
             tipo = sentencia[0]
             if tipo == 'let':
-                offset[0] += TAMANO_SLOT
-                self._offsets_por_nodo[id(sentencia)] = offset[0]
+                longitud = self._longitud_arreglo_1d(sentencia[3])
+                if longitud is not None:
+                    offset_elem0 = offset[0] + 8
+                    offset[0] += longitud * 8
+                    self._offsets_por_nodo[id(sentencia)] = offset_elem0
+                    self._longitudes_por_nodo[id(sentencia)] = longitud
+                else:
+                    offset[0] += TAMANO_SLOT
+                    self._offsets_por_nodo[id(sentencia)] = offset[0]
             elif tipo == 'if':
                 self._recolectar_lets(sentencia[2], offset)
                 cuerpo_else = sentencia[3]
@@ -242,7 +267,8 @@ class GeneradorCodigo:
 
     def _declarar_variable(self, nodo_let, contexto):
         offset = self._offsets_por_nodo[id(nodo_let)]
-        contexto['scopes'][-1][nodo_let[1]] = offset
+        longitud = self._longitudes_por_nodo.get(id(nodo_let))
+        contexto['scopes'][-1][nodo_let[1]] = {'offset': offset, 'longitud': longitud}
         return offset
 
     def _buscar_variable(self, nombre, contexto):
@@ -277,6 +303,8 @@ class GeneradorCodigo:
             self._generar_match(sentencia, contexto)
         elif tipo == 'return':
             self._generar_return(sentencia, contexto)
+        elif tipo == 'asignar_indice':
+            self._generar_asignar_indice(sentencia, contexto)
         else:
             self.texto.append(f'    # sentencia "{tipo}"')
 
@@ -420,6 +448,11 @@ class GeneradorCodigo:
         nombre = nodo[1]
         valor = nodo[3]
 
+        if valor is not None and valor[0] in ('array_literal', 'array_repeat'):
+            offset_elem0 = self._declarar_variable(nodo, contexto)
+            self._generar_inicializacion_arreglo(valor, offset_elem0, contexto)
+            return
+
         if valor is None:
             # Sin valor inicial: se deja en 0
             offset = self._declarar_variable(nodo, contexto)
@@ -431,14 +464,53 @@ class GeneradorCodigo:
         offset = self._declarar_variable(nodo, contexto)
         self._guardar_variable('x0', offset)
 
+    def _generar_inicializacion_arreglo(self, valor, offset_elem0, contexto):
+        # Los indices son constantes de compilacion (posicion dentro del literal), asi que se usa _guardar_variable directo por cada elemento
+        if valor[0] == 'array_literal':
+            for i, elemento in enumerate(valor[1]):
+                self._generar_expresion(elemento, contexto)
+                self._guardar_variable('x0', offset_elem0 + i * 8)
+        elif valor[0] == 'array_repeat':
+            elemento, n = valor[1], valor[2]
+            self._generar_expresion(elemento, contexto) # se evalua una sola vez
+            self.texto.append('    mov x2, x0')
+            for i in range(n):
+                self._guardar_variable('x2', offset_elem0 + i * 8)
+
     def _generar_asignar(self, nodo, contexto):
         # nodo = ('asignar', nombre, valor)
         nombre = nodo[1]
         valor = nodo[2]
 
         self._generar_expresion(valor, contexto)
-        offset = self._buscar_variable(nombre, contexto)
+        offset = self._buscar_variable(nombre, contexto)['offset']
         self._guardar_variable('x0', offset)
+
+    def _generar_asignar_indice(self, nodo, contexto):
+        # nodo = ('asignar_indice', base, indice, valor)
+        base, indice, valor = nodo[1], nodo[2], nodo[3]
+        if base[0] != 'var':
+            self.texto.append('    # asignar_indice: solo sobre una variable directa por ahora')
+            return
+        info = self._buscar_variable(base[1], contexto)
+        if info['longitud'] is None:
+            self.texto.append(f'    # "{base[1]}" no es un arreglo conocido por el codegen')
+            return
+
+        self._generar_expresion(valor, contexto)      # x0 = valor a guardar
+        self.texto.append('    str x0, [sp, -16]!')   # se protege el valor mientras se calcula la direccion
+        self._generar_direccion_arreglo(info['offset'], indice, contexto)   # x1 = direccion real
+        self.texto.append('    ldr x0, [sp], 16')
+        self.texto.append('    str x0, [x1]')
+
+    def _generar_direccion_arreglo(self, offset_elem0, nodo_indice, contexto):
+        # Deja en x1 la direccion real (offset_elem0 + indice*8 respecto a x29)
+        # El indice se evalua en tiempo de ejecucion, calculandolo con aritmetica de registros
+        self._generar_expresion(nodo_indice, contexto)      # x0 = indice
+        self.texto.append('    lsl x0, x0, #3')             # x0 = indice * 8
+        self.texto.append(f'    mov x1, #{offset_elem0}')
+        self.texto.append('    add x1, x1, x0')
+        self.texto.append('    sub x1, x29, x1')
 
     # --- EXPRESIONES (dejan el resultado en x0) ---
 
@@ -451,8 +523,22 @@ class GeneradorCodigo:
             self.texto.append(f'    mov x0, #{1 if nodo[1] else 0}')
         elif tipo == 'var':
             nombre = nodo[1]
-            offset = self._buscar_variable(nombre, contexto)
-            self._cargar_variable('x0', offset)
+            info = self._buscar_variable(nombre, contexto)
+            if info['longitud'] is not None:
+                self.texto.append(f'    # "{nombre}" es un arreglo, imprimir/usar el arreglo completo aun no esta')
+                return
+            self._cargar_variable('x0', info['offset'])
+        elif tipo == 'array_access':
+            base, indice = nodo[1], nodo[2]
+            if base[0] != 'var':
+                self.texto.append('    # array_access: solo sobre una variable directa por ahora')
+                return
+            info = self._buscar_variable(base[1], contexto)
+            if info['longitud'] is None:
+                self.texto.append(f'    # "{base[1]}" no es un arreglo conocido por el codegen')
+                return
+            self._generar_direccion_arreglo(info['offset'], indice, contexto)
+            self.texto.append('    ldr x0, [x1]')
         elif tipo == 'llamada':
             self._generar_llamada(nodo, contexto)
         elif tipo == 'binop':
@@ -543,6 +629,16 @@ class GeneradorCodigo:
     def _generar_llamada(self, nodo, contexto):
         nombre = nodo[1]
         argumentos = nodo[2]
+
+        if nombre == 'len':
+            receptor = argumentos[0] if argumentos else None
+            if receptor is not None and receptor[0] == 'var':
+                info = self._buscar_variable(receptor[1], contexto)
+                if info['longitud'] is not None:
+                    self.texto.append(f'    mov x0, #{info["longitud"]}')
+                    return
+            self.texto.append('    # .len(): solo soportado sobre una variable de arreglo conocida')
+            return
 
         if nombre == 'println':
             arg_valor = None

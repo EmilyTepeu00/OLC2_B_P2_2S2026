@@ -144,6 +144,21 @@ fn main() {
 
     let r2 = factorial(5);
     println!(r2);
+
+    let numeros: [i32; 5] = [10, 20, 30, 40, 50];
+    println!(numeros[0]);
+    println!(numeros[4]);
+
+    let idx = 2;
+    println!(numeros[idx]);
+
+    numeros[2] = 999;
+    println!(numeros[2]);
+    println!(numeros.len());
+
+    let ceros = [7; 4];
+    println!(ceros[0]);
+    println!(ceros[3]);
 }
 """
 
@@ -215,7 +230,7 @@ if exito:
     print(f'Stdout: {resultado.stdout!r}')
     print(f'Stderr: {resultado.stderr!r}')
 
-    esperado = '42\n7\n100\n11\n3\n2\n1\n0\n1\n27\n1\n10\n2\n1\n6\n0\n0\n1\n2\n1\n3\n4\n2\n6\n999\n200\n7\n120\n'
+    esperado = '42\n7\n100\n11\n3\n2\n1\n0\n1\n27\n1\n10\n2\n1\n6\n0\n0\n1\n2\n1\n3\n4\n2\n6\n999\n200\n7\n120\n10\n50\n30\n999\n5\n7\n7\n'
     if resultado.stdout == esperado and resultado.returncode == 0:
         print('\nOK: la salida coincide con lo esperado (42 / 7 / 100)')
     else:
