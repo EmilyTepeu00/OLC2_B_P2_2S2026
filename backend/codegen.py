@@ -4,7 +4,7 @@
 SYSCALL_WRITE = 64
 SYSCALL_EXIT = 93
 
-TAMANO_SLOT = 16  # bytes reservados por variable (simple sin empacar)
+TAMANO_SLOT = 16  # bytes reservados por variable escalar (simple sin empacar)
 
 
 class GeneradorCodigo:
@@ -15,7 +15,7 @@ class GeneradorCodigo:
         self._contador_etiquetas = 0
         self._usa_imprimir_entero = False
         self._offsets_por_nodo = {}     # id(nodo 'let') -> offset unico en el stack frame
-        self._longitudes_por_nodo = {}  # id(nodo 'let') -> cantidad de elementos, solo arreglos
+        self._formas_por_nodo = {}      # id(nodo 'let') -> [dim0, dim1, ...] si es arreglo
 
     def nueva_etiqueta(self, prefijo='L'):
         self._contador_etiquetas += 1
@@ -28,7 +28,7 @@ class GeneradorCodigo:
         self.errores = []
         self._usa_imprimir_entero = False
         self._offsets_por_nodo = {}
-        self._longitudes_por_nodo = {}
+        self._formas_por_nodo = {}
 
         programa = ast
         funciones = [d for d in programa[1] if d[0] == 'funcion']
@@ -155,13 +155,17 @@ class GeneradorCodigo:
         espacio = self._reservar_variables(cuerpo, parametros)
         self._ajustar_sp('sub', espacio)
 
-        contexto = {'scopes': [{}], 'bucles': [], 'etiqueta_fin_funcion': self.nueva_etiqueta('fin_funcion')}
+        contexto = {
+            'scopes': [{}],
+            'bucles': [],
+            'etiqueta_fin_funcion': self.nueva_etiqueta('fin_funcion'),
+        }
 
         # Los primeros 8 parametros llegan en x0-x7 y se copian a su slot en el stack antes de generar el cuerpo 
         # para que el resto del codigo lo trate igual que cualquier otra variable
         for i, parametro in enumerate(parametros):
             offset = self._offsets_por_nodo[id(parametro)]
-            contexto['scopes'][0][parametro[0]] = {'offset': offset, 'longitud': None}
+            contexto['scopes'][0][parametro[0]] = {'offset': offset, 'forma': None}
             if i < len(self.REGISTROS_PARAMETRO):
                 self._guardar_variable(self.REGISTROS_PARAMETRO[i], offset)
             else:
@@ -177,6 +181,47 @@ class GeneradorCodigo:
         self.texto.append('    ret')
         self.texto.append('')
 
+    # --- RESERVA DE MEMORIA (variables escalares y arreglos, incluye parametros) ---
+
+    def _forma_arreglo(self, valor):
+        # Dimensiones de un arreglo, en el mismo orden que se escriben los indices: [dim_0, dim_1, ...]
+        # None si 'valor' no es un array_literal/array_repeat
+        if valor is None:
+            return None
+        forma = []
+        actual = valor
+        while actual is not None and actual[0] in ('array_literal', 'array_repeat'):
+            if actual[0] == 'array_literal':
+                elementos = actual[1]
+                forma.append(len(elementos))
+                actual = elementos[0] if elementos else None
+            else:
+                forma.append(actual[2])
+                actual = actual[1]
+        return forma if forma else None
+
+    def _aplanar_valores(self, valor):
+        # Lista de nodos-expresion escalares en orden row-major (recorre arreglos anidados y expande [v; N] repitiendo el nodo N veces)
+        if valor[0] == 'array_literal':
+            resultado = []
+            for elemento in valor[1]:
+                resultado.extend(self._aplanar_valores(elemento))
+            return resultado
+        if valor[0] == 'array_repeat':
+            elemento, n = valor[1], valor[2]
+            return self._aplanar_valores(elemento) * n
+        return [valor]
+
+    def _strides(self, forma):
+        # stride[j] = cuantos elementos se saltan al aumentar el indice j en 1 (row-major: el ultimo indice es el que varia mas seguido)
+        strides = []
+        acumulado = 1
+        for dim in reversed(forma):
+            strides.append(acumulado)
+            acumulado *= dim
+        strides.reverse()
+        return strides
+
     def _reservar_variables(self, cuerpo, parametros=()):
         # Cada parametro y cada 'let' del cuerpo recibe su propio slot, identificado por el nodo
         # Asi dos variables con el mismo nombre en bloques distintos nunca comparten memoria
@@ -187,32 +232,19 @@ class GeneradorCodigo:
         self._recolectar_lets(cuerpo, offset)
         return offset[0]
 
-    def _longitud_arreglo_1d(self, valor):
-        # Longitud si 'valor' es un arreglo unidimensional (literal o [v; N])
-        # None si no es arreglo, o si es multidimensional
-        if valor is None:
-            return None
-        if valor[0] == 'array_literal':
-            elementos = valor[1]
-            if elementos and elementos[0][0] in ('array_literal', 'array_repeat'):
-                return None
-            return len(elementos)
-        if valor[0] == 'array_repeat':
-            if valor[1][0] in ('array_literal', 'array_repeat'):
-                return None
-            return valor[2]
-        return None
-
     def _recolectar_lets(self, sentencias, offset):
         for sentencia in sentencias:
             tipo = sentencia[0]
             if tipo == 'let':
-                longitud = self._longitud_arreglo_1d(sentencia[3])
-                if longitud is not None:
+                forma = self._forma_arreglo(sentencia[3])
+                if forma is not None:
+                    total = 1
+                    for dim in forma:
+                        total *= dim
                     offset_elem0 = offset[0] + 8
-                    offset[0] += longitud * 8
+                    offset[0] += total * 8
                     self._offsets_por_nodo[id(sentencia)] = offset_elem0
-                    self._longitudes_por_nodo[id(sentencia)] = longitud
+                    self._formas_por_nodo[id(sentencia)] = forma
                 else:
                     offset[0] += TAMANO_SLOT
                     self._offsets_por_nodo[id(sentencia)] = offset[0]
@@ -267,8 +299,8 @@ class GeneradorCodigo:
 
     def _declarar_variable(self, nodo_let, contexto):
         offset = self._offsets_por_nodo[id(nodo_let)]
-        longitud = self._longitudes_por_nodo.get(id(nodo_let))
-        contexto['scopes'][-1][nodo_let[1]] = {'offset': offset, 'longitud': longitud}
+        forma = self._formas_por_nodo.get(id(nodo_let))
+        contexto['scopes'][-1][nodo_let[1]] = {'offset': offset, 'forma': forma}
         return offset
 
     def _buscar_variable(self, nombre, contexto):
@@ -277,6 +309,41 @@ class GeneradorCodigo:
             if nombre in scope:
                 return scope[nombre]
         raise KeyError(f'variable "{nombre}" sin declarar en el codegen')
+
+    # --- ARREGLOS: descomposicion de accesos encadenados ---
+
+    def _descomponer_acceso(self, nodo):
+        # Desenreda una cadena de ('array_access', base, indice) anidada hasta llegar a ('var', nombre)
+        # Devuelve (nombre, [indices]) en el mismo orden en que se escribieron: matrix[1][2] -> (matrix, [1, 2])
+        # (None, None) si la base final no es una variable directa
+        indices = []
+        actual = nodo
+        while actual[0] == 'array_access':
+            indices.append(actual[2])
+            actual = actual[1]
+        if actual[0] != 'var':
+            return None, None
+        indices.reverse()
+        return actual[1], indices
+
+    def _generar_direccion_arreglo(self, offset_elem0, indices, forma, contexto):
+        # Deja en x1 la direccion real de arr[i0][i1]...[iN] (row-major)
+        strides = self._strides(forma)
+        self.texto.append('    mov x0, #0')
+        self.texto.append('    str x0, [sp, -16]!')
+        for nodo_indice, stride in zip(indices, strides):
+            self._generar_expresion(nodo_indice, contexto)  # x0 = indice
+            if stride != 1:
+                self.texto.append(f'    mov x1, #{stride}')
+                self.texto.append('    mul x0, x0, x1')
+            self.texto.append('    ldr x1, [sp]')
+            self.texto.append('    add x1, x1, x0')
+            self.texto.append('    str x1, [sp]')
+        self.texto.append('    ldr x0, [sp], 16')
+        self.texto.append('    lsl x0, x0, #3')
+        self.texto.append(f'    mov x1, #{offset_elem0}')
+        self.texto.append('    add x1, x1, x0')
+        self.texto.append('    sub x1, x29, x1')
 
     # --- SENTENCIAS ---
 
@@ -287,6 +354,8 @@ class GeneradorCodigo:
             self._generar_let(sentencia, contexto)
         elif tipo == 'asignar':
             self._generar_asignar(sentencia, contexto)
+        elif tipo == 'asignar_indice':
+            self._generar_asignar_indice(sentencia, contexto)
         elif tipo == 'llamada':
             self._generar_expresion(sentencia, contexto)
         elif tipo == 'if':
@@ -303,8 +372,6 @@ class GeneradorCodigo:
             self._generar_match(sentencia, contexto)
         elif tipo == 'return':
             self._generar_return(sentencia, contexto)
-        elif tipo == 'asignar_indice':
-            self._generar_asignar_indice(sentencia, contexto)
         else:
             self.texto.append(f'    # sentencia "{tipo}"')
 
@@ -443,9 +510,10 @@ class GeneradorCodigo:
             self._generar_expresion(valor, contexto)
         self.texto.append(f'    b {contexto["etiqueta_fin_funcion"]}')
 
+    # --- LET / ASIGNACIONES ---
+
     def _generar_let(self, nodo, contexto):
         # nodo = ('let', nombre, tipo, valor, mutable)
-        nombre = nodo[1]
         valor = nodo[3]
 
         if valor is not None and valor[0] in ('array_literal', 'array_repeat'):
@@ -465,17 +533,10 @@ class GeneradorCodigo:
         self._guardar_variable('x0', offset)
 
     def _generar_inicializacion_arreglo(self, valor, offset_elem0, contexto):
-        # Los indices son constantes de compilacion (posicion dentro del literal), asi que se usa _guardar_variable directo por cada elemento
-        if valor[0] == 'array_literal':
-            for i, elemento in enumerate(valor[1]):
-                self._generar_expresion(elemento, contexto)
-                self._guardar_variable('x0', offset_elem0 + i * 8)
-        elif valor[0] == 'array_repeat':
-            elemento, n = valor[1], valor[2]
-            self._generar_expresion(elemento, contexto) # se evalua una sola vez
-            self.texto.append('    mov x2, x0')
-            for i in range(n):
-                self._guardar_variable('x2', offset_elem0 + i * 8)
+        # Los indices son constantes de compilacion (posicion dentro del literal ya aplanado) asi que se usa _guardar_variable directo por cada elemento
+        for i, elemento in enumerate(self._aplanar_valores(valor)):
+            self._generar_expresion(elemento, contexto)
+            self._guardar_variable('x0', offset_elem0 + i * 8)
 
     def _generar_asignar(self, nodo, contexto):
         # nodo = ('asignar', nombre, valor)
@@ -488,29 +549,22 @@ class GeneradorCodigo:
 
     def _generar_asignar_indice(self, nodo, contexto):
         # nodo = ('asignar_indice', base, indice, valor)
+        # base puede ser ('var', nombre) o a su vez ('array_access', ..., ...) para dimensiones intermedias
         base, indice, valor = nodo[1], nodo[2], nodo[3]
-        if base[0] != 'var':
-            self.texto.append('    # asignar_indice: solo sobre una variable directa por ahora')
+        nombre, indices = self._descomponer_acceso(('array_access', base, indice))
+        if nombre is None:
+            self.texto.append('    # asignar_indice: forma de acceso no soportada')
             return
-        info = self._buscar_variable(base[1], contexto)
-        if info['longitud'] is None:
-            self.texto.append(f'    # "{base[1]}" no es un arreglo conocido por el codegen')
+        info = self._buscar_variable(nombre, contexto)
+        if info['forma'] is None:
+            self.texto.append(f'    # "{nombre}" no es un arreglo conocido por el codegen')
             return
 
         self._generar_expresion(valor, contexto)      # x0 = valor a guardar
         self.texto.append('    str x0, [sp, -16]!')   # se protege el valor mientras se calcula la direccion
-        self._generar_direccion_arreglo(info['offset'], indice, contexto)   # x1 = direccion real
+        self._generar_direccion_arreglo(info['offset'], indices, info['forma'], contexto)   # x1 = direccion real
         self.texto.append('    ldr x0, [sp], 16')
         self.texto.append('    str x0, [x1]')
-
-    def _generar_direccion_arreglo(self, offset_elem0, nodo_indice, contexto):
-        # Deja en x1 la direccion real (offset_elem0 + indice*8 respecto a x29)
-        # El indice se evalua en tiempo de ejecucion, calculandolo con aritmetica de registros
-        self._generar_expresion(nodo_indice, contexto)      # x0 = indice
-        self.texto.append('    lsl x0, x0, #3')             # x0 = indice * 8
-        self.texto.append(f'    mov x1, #{offset_elem0}')
-        self.texto.append('    add x1, x1, x0')
-        self.texto.append('    sub x1, x29, x1')
 
     # --- EXPRESIONES (dejan el resultado en x0) ---
 
@@ -524,20 +578,20 @@ class GeneradorCodigo:
         elif tipo == 'var':
             nombre = nodo[1]
             info = self._buscar_variable(nombre, contexto)
-            if info['longitud'] is not None:
+            if info['forma'] is not None:
                 self.texto.append(f'    # "{nombre}" es un arreglo, imprimir/usar el arreglo completo aun no esta')
                 return
             self._cargar_variable('x0', info['offset'])
         elif tipo == 'array_access':
-            base, indice = nodo[1], nodo[2]
-            if base[0] != 'var':
-                self.texto.append('    # array_access: solo sobre una variable directa por ahora')
+            nombre, indices = self._descomponer_acceso(nodo)
+            if nombre is None:
+                self.texto.append('    # array_access: forma de acceso no esta')
                 return
-            info = self._buscar_variable(base[1], contexto)
-            if info['longitud'] is None:
-                self.texto.append(f'    # "{base[1]}" no es un arreglo conocido por el codegen')
+            info = self._buscar_variable(nombre, contexto)
+            if info['forma'] is None:
+                self.texto.append(f'    # "{nombre}" no es un arreglo conocido por el codegen')
                 return
-            self._generar_direccion_arreglo(info['offset'], indice, contexto)
+            self._generar_direccion_arreglo(info['offset'], indices, info['forma'], contexto)
             self.texto.append('    ldr x0, [x1]')
         elif tipo == 'llamada':
             self._generar_llamada(nodo, contexto)
@@ -634,13 +688,14 @@ class GeneradorCodigo:
             receptor = argumentos[0] if argumentos else None
             if receptor is not None and receptor[0] == 'var':
                 info = self._buscar_variable(receptor[1], contexto)
-                if info['longitud'] is not None:
-                    self.texto.append(f'    mov x0, #{info["longitud"]}')
+                if info['forma'] is not None:
+                    self.texto.append(f'    mov x0, #{info["forma"][0]}')
                     return
             self.texto.append('    # .len(): solo soportado sobre una variable de arreglo conocida')
             return
 
         if nombre == 'println':
+            # Soportado: println!(x)  o  println!("{}", x)  con un entero
             arg_valor = None
             if len(argumentos) == 1:
                 arg_valor = argumentos[0]
@@ -648,14 +703,15 @@ class GeneradorCodigo:
                 arg_valor = argumentos[1]
 
             if arg_valor is None:
-                self.texto.append('    # TODO: forma de println! aun no esta')
+                self.texto.append('    # forma de println! no soportada (multiples args / strings)')
                 return
 
             self._generar_expresion(arg_valor, contexto)    # deja el valor en x0
             self.texto.append('    bl imprimir_entero')
             self._usa_imprimir_entero = True
-        else:
-            self._generar_llamada_usuario(nombre, argumentos, contexto)
+            return
+
+        self._generar_llamada_usuario(nombre, argumentos, contexto)
 
     def _generar_llamada_usuario(self, nombre, argumentos, contexto):
         # Cada argumento se evalua y se guarda en el stack de inmediato y al final se sacan en orden inverso para dejarlos en x0, x1, x2...

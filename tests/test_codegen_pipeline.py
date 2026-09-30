@@ -159,6 +159,25 @@ fn main() {
     let ceros = [7; 4];
     println!(ceros[0]);
     println!(ceros[3]);
+
+    let matrix: [[i32; 3]; 2] = [
+        [1, 2, 3],
+        [4, 5, 6]
+    ];
+    println!(matrix[0][0]);
+    println!(matrix[1][2]);
+    matrix[1][2] = 99;
+    println!(matrix[1][2]);
+    println!(matrix.len());
+
+    let cubo: [[[i32; 2]; 2]; 2] = [
+        [[1, 2], [3, 4]],
+        [[5, 6], [7, 8]]
+    ];
+    println!(cubo[0][1][0]);
+    println!(cubo[1][1][1]);
+    cubo[0][1][0] = 77;
+    println!(cubo[0][1][0]);
 }
 """
 
@@ -230,7 +249,7 @@ if exito:
     print(f'Stdout: {resultado.stdout!r}')
     print(f'Stderr: {resultado.stderr!r}')
 
-    esperado = '42\n7\n100\n11\n3\n2\n1\n0\n1\n27\n1\n10\n2\n1\n6\n0\n0\n1\n2\n1\n3\n4\n2\n6\n999\n200\n7\n120\n10\n50\n30\n999\n5\n7\n7\n'
+    esperado = '42\n7\n100\n11\n3\n2\n1\n0\n1\n27\n1\n10\n2\n1\n6\n0\n0\n1\n2\n1\n3\n4\n2\n6\n999\n200\n7\n120\n10\n50\n30\n999\n5\n7\n7\n1\n6\n99\n2\n3\n8\n77\n'
     if resultado.stdout == esperado and resultado.returncode == 0:
         print('\nOK: la salida coincide con lo esperado (42 / 7 / 100)')
     else:
