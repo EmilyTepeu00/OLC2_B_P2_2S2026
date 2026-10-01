@@ -14,6 +14,7 @@ class GeneradorCodigo:
         self.errores = []
         self._contador_etiquetas = 0
         self._usa_imprimir_entero = False
+        self._usa_salto_de_linea = False
         self._offsets_por_nodo = {}     # id(nodo 'let') -> offset unico en el stack frame
         self._formas_por_nodo = {}      # id(nodo 'let') -> [dim0, dim1, ...] si es arreglo
 
@@ -27,6 +28,7 @@ class GeneradorCodigo:
         self.datos = []
         self.errores = []
         self._usa_imprimir_entero = False
+        self._usa_salto_de_linea = False
         self._offsets_por_nodo = {}
         self._formas_por_nodo = {}
 
@@ -56,6 +58,7 @@ class GeneradorCodigo:
         if self._usa_imprimir_entero:
             lineas.append('buffer_entero: .skip 24')
             lineas.append('buffer_entero_fin:')
+        if self._usa_salto_de_linea:
             lineas.append('salto_de_linea: .ascii "\\n"')
         if self.datos:
             lineas.extend(self.datos)
@@ -81,7 +84,8 @@ class GeneradorCodigo:
 
     def _rutina_imprimir_entero(self):
         # Entrada: x0 = valor entero (con signo) a imprimir
-        # Convierte a decimal ASCII en buffer_entero (construyendo del final al principio) y lo escribe a stdout + '\n'
+        # Convierte a decimal ASCII en buffer_entero (construyendo del final al principio) y lo escribe a stdout
+        # (Sin salto de linea, eso lo agrega quien llama, una sola vez al final de todo el println!)
         return '\n'.join([
             'imprimir_entero:',
             '    stp x29, x30, [sp, -32]!',
@@ -122,12 +126,6 @@ class GeneradorCodigo:
             '    adr x14, buffer_entero_fin',
             '    sub x2, x14, x10',
             '    mov x1, x10',
-            '    mov x0, #1',
-            f'    mov x8, #{SYSCALL_WRITE}',
-            '    svc #0',
-            '',
-            '    adr x1, salto_de_linea',
-            '    mov x2, #1',
             '    mov x0, #1',
             f'    mov x8, #{SYSCALL_WRITE}',
             '    svc #0',
@@ -301,10 +299,10 @@ class GeneradorCodigo:
     def _cerrar_scope(self, contexto):
         contexto['scopes'].pop()
 
-    def _declarar_variable(self, nodo_let, contexto):
+    def _declarar_variable(self, nodo_let, contexto, string_len=None):
         offset = self._offsets_por_nodo[id(nodo_let)]
         forma = self._formas_por_nodo.get(id(nodo_let))
-        contexto['scopes'][-1][nodo_let[1]] = {'offset': offset, 'forma': forma}
+        contexto['scopes'][-1][nodo_let[1]] = {'offset': offset, 'forma': forma, 'string_len': string_len}
         return offset
 
     def _buscar_variable(self, nombre, contexto):
@@ -525,6 +523,14 @@ class GeneradorCodigo:
             self._generar_inicializacion_arreglo(valor, offset_elem0, contexto)
             return
 
+        if valor is not None and valor[0] in ('string', 'string_from'):
+            # La variable guarda un puntero] al texto fijo en .data, igual que cualquier otro escalar
+            etiqueta, longitud = self._emitir_literal_string(self._texto_de_nodo_string(valor))
+            self.texto.append(f'    adr x0, {etiqueta}')
+            offset = self._declarar_variable(nodo, contexto, string_len=longitud)
+            self._guardar_variable('x0', offset)
+            return
+
         if valor is None:
             # Sin valor inicial: se deja en 0
             offset = self._declarar_variable(nodo, contexto)
@@ -695,27 +701,96 @@ class GeneradorCodigo:
                 if info['forma'] is not None:
                     self.texto.append(f'    mov x0, #{info["forma"][0]}')
                     return
-            self.texto.append('    # .len(): solo soportado sobre una variable de arreglo conocida')
+                if info.get('string_len') is not None:
+                    self.texto.append(f'    mov x0, #{info["string_len"]}')
+                    return
+            self.texto.append('    # .len(): solo soportado sobre una variable de arreglo o string conocida')
             return
 
         if nombre == 'println':
-            # Soportado: println!(x)  o  println!("{}", x)  con un entero
-            arg_valor = None
-            if len(argumentos) == 1:
-                arg_valor = argumentos[0]
-            elif len(argumentos) == 2 and argumentos[0][0] == 'string':
-                arg_valor = argumentos[1]
-
-            if arg_valor is None:
-                self.texto.append('    # forma de println! no soportada (multiples args / strings)')
-                return
-
-            self._generar_expresion(arg_valor, contexto)    # deja el valor en x0
-            self.texto.append('    bl imprimir_entero')
-            self._usa_imprimir_entero = True
+            self._generar_println(argumentos, contexto)
             return
 
         self._generar_llamada_usuario(nombre, argumentos, contexto)
+
+    # --- IMPRESION: println! con texto literal + enteros + strings intercalados ---
+
+    def _generar_println(self, argumentos, contexto):
+        # println!(x)                   -> un solo valor, sin texto alrededor
+        # println!("texto {} mas", x)   -> texto literal con "{}" por cada valor
+        if len(argumentos) >= 2 and argumentos[0][0] == 'string':
+            formato = argumentos[0][1]
+            valores = argumentos[1:]
+            partes = formato.split('{}')
+            if len(partes) - 1 != len(valores):
+                self.texto.append('    # println!: cantidad de "{}" no coincide con la cantidad de argumentos')
+            for i, parte in enumerate(partes):
+                if parte:
+                    self._generar_escribir_texto_literal(parte)
+                if i < len(valores):
+                    self._generar_escribir_valor(valores[i], contexto)
+            self._generar_salto_de_linea()
+            return
+
+        if len(argumentos) == 1:
+            self._generar_escribir_valor(argumentos[0], contexto)
+            self._generar_salto_de_linea()
+            return
+
+        self.texto.append('    # forma de println! no soportada')
+
+    def _generar_escribir_valor(self, nodo, contexto):
+        if self._es_tipo_string(nodo, contexto):
+            self._generar_escribir_string_nodo(nodo, contexto)
+        else:
+            self._generar_expresion(nodo, contexto)     # deja el valor en x0
+            self.texto.append('    bl imprimir_entero')
+            self._usa_imprimir_entero = True
+
+    def _emitir_literal_string(self, texto):
+        etiqueta = self.nueva_etiqueta('str')[1:]   # sin el punto: va al .data, no es una etiqueta local
+        escapado = texto.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+        longitud = len(texto.encode('utf-8'))
+        self.datos.append(f'{etiqueta}: .ascii "{escapado}"')
+        return etiqueta, longitud
+
+    def _es_tipo_string(self, nodo, contexto):
+        if nodo[0] in ('string', 'string_from'):
+            return True
+        if nodo[0] == 'var':
+            info = self._buscar_variable(nodo[1], contexto)
+            return info.get('string_len') is not None
+        return False
+
+    def _texto_de_nodo_string(self, nodo):
+        return nodo[1] if nodo[0] == 'string' else nodo[1][1]
+
+    def _generar_escribir_texto_literal(self, texto):
+        etiqueta, longitud = self._emitir_literal_string(texto)
+        self.texto.append(f'    adr x1, {etiqueta}')
+        self.texto.append(f'    mov x2, #{longitud}')
+        self.texto.append('    mov x0, #1')
+        self.texto.append(f'    mov x8, #{SYSCALL_WRITE}')
+        self.texto.append('    svc #0')
+
+    def _generar_escribir_string_nodo(self, nodo, contexto):
+        if nodo[0] in ('string', 'string_from'):
+            self._generar_escribir_texto_literal(self._texto_de_nodo_string(nodo))
+            return
+        info = self._buscar_variable(nodo[1], contexto)
+        self._cargar_variable('x1', info['offset'])
+        self.texto.append(f'    mov x2, #{info["string_len"]}')
+        self.texto.append('    mov x0, #1')
+        self.texto.append(f'    mov x8, #{SYSCALL_WRITE}')
+        self.texto.append('    svc #0')
+
+    def _generar_salto_de_linea(self):
+        self.texto.append('    adr x1, salto_de_linea')
+        self.texto.append('    mov x2, #1')
+        self.texto.append('    mov x0, #1')
+        self.texto.append(f'    mov x8, #{SYSCALL_WRITE}')
+        self.texto.append('    svc #0')
+        self._usa_salto_de_linea = True
 
     def _generar_llamada_usuario(self, nombre, argumentos, contexto):
         # Cada argumento se evalua y se guarda en el stack de inmediato y al final se sacan en orden inverso para dejarlos en x0, x1, x2...
