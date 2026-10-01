@@ -241,8 +241,12 @@ class GeneradorCodigo:
                     total = 1
                     for dim in forma:
                         total *= dim
+                    bytes_necesarios = total * 8
+                    # AArch64 exige que lo reservado con sub sp sea multiplo de 16 las variables escalares ya lo cumplen (slots de 16)
+                    # Se redondea hacia arriba ya que un arreglo con cantidad impar de elementos (N*8 con N impar) no cumple
+                    bytes_reservados = ((bytes_necesarios + 15) // 16) * 16
                     offset_elem0 = offset[0] + 8
-                    offset[0] += total * 8
+                    offset[0] += bytes_reservados
                     self._offsets_por_nodo[id(sentencia)] = offset_elem0
                     self._formas_por_nodo[id(sentencia)] = forma
                 else:
