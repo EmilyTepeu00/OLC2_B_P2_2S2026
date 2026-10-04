@@ -4,8 +4,12 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from backend.parser import parsear
 from backend.semantic import AnalizadorSemantico
-from backend.interpreter import Interprete
+from backend.codegen import GeneradorCodigo
 from backend.ast_generator import generar_ast
+import os
+import subprocess
+import tempfile
+import time
 
 app = Flask(__name__)
 CORS(app)  # Permitir peticiones desde el frontend
@@ -19,6 +23,76 @@ def formatear_error(error):
     columna = error.get('columna')
     encabezado = f"[Error {tipo}] Línea {linea}" + (f", Columna {columna}" if columna else "")
     return f"{encabezado}\n{error.get('mensaje', '')}"
+
+
+def compilar_y_ejecutar(codigo_asm):
+    # Ensambla, enlaza y ejecuta el .s generado con QEMU User, todo en un directorio temporal
+    # Devuelve salida, tiempo, errores
+    errores = []
+    salida = []
+    tiempo = '0.000s'
+
+    with tempfile.TemporaryDirectory() as directorio:
+        ruta_s = os.path.join(directorio, 'programa.s')
+        ruta_o = os.path.join(directorio, 'programa.o')
+        ruta_bin = os.path.join(directorio, 'programa')
+
+        with open(ruta_s, 'w') as f:
+            f.write(codigo_asm)
+
+        proceso_as = subprocess.run(
+            ['aarch64-linux-gnu-as', ruta_s, '-o', ruta_o],
+            capture_output=True, text=True,
+        )
+        if proceso_as.returncode != 0:
+            errores.append({
+                'tipo': 'Ensamblador',
+                'linea': 0,
+                'mensaje': proceso_as.stderr.strip() or 'Falló el ensamblado del codigo ARM64',
+            })
+            return salida, tiempo, errores
+
+        proceso_ld = subprocess.run(
+            ['aarch64-linux-gnu-ld', '-static', ruta_o, '-o', ruta_bin],
+            capture_output=True, text=True,
+        )
+        if proceso_ld.returncode != 0:
+            errores.append({
+                'tipo': 'Enlazador',
+                'linea': 0,
+                'mensaje': proceso_ld.stderr.strip() or 'Falló el enlazado del ejecutable',
+            })
+            return salida, tiempo, errores
+
+        inicio = time.perf_counter()
+        try:
+            proceso_qemu = subprocess.run(
+                ['qemu-aarch64', ruta_bin],
+                capture_output=True, text=True, timeout=10,
+            )
+        except subprocess.TimeoutExpired:
+            errores.append({
+                'tipo': 'Ejecucion',
+                'linea': 0,
+                'mensaje': 'El programa no terminó en 10 segundos (posible bucle infinito)',
+            })
+            return salida, tiempo, errores
+        tiempo = f'{time.perf_counter() - inicio:.4f}s'
+
+        if proceso_qemu.stdout:
+            salida = proceso_qemu.stdout.split('\n')
+            if salida and salida[-1] == '':
+                salida.pop()
+
+        if proceso_qemu.returncode != 0:
+            detalle = f'\n{proceso_qemu.stderr.strip()}' if proceso_qemu.stderr else ''
+            errores.append({
+                'tipo': 'Ejecucion',
+                'linea': 0,
+                'mensaje': f'El programa terminó con codigo de salida {proceso_qemu.returncode}.{detalle}',
+            })
+
+    return salida, tiempo, errores
 
 
 @app.route('/execute', methods=['POST'])
@@ -42,26 +116,15 @@ def ejecutar():
         symbols = []
         ast_nodes = []
         ast_image = ''
+        codigo_arm64 = ''
+        tiempo = '0.000s'
 
         # Si no se pudo construir el AST, no se sigue con el semantico y se reportan errores
         if ast is not None:
-            # ANALISIS SEMANTICO (sigue corriendo aunque haya habido siempre que exista el AST
+            # ANALISIS SEMANTICO (siempre que exista el AST)
             analizador = AnalizadorSemantico()
             errores_semanticos = analizador.analizar(ast, lineas=lineas, columnas=columnas)
             errores_totales += errores_semanticos
-
-            # EJECUCION (siempre que haya AST)
-            lineas_con_error_semantico = {
-                e['linea'] for e in errores_semanticos
-                if e.get('linea')
-                and 'no permitido entre' not in str(e.get('mensaje', ''))
-                and not str(e.get('mensaje', '')).startswith('Tipos incompatibles')
-            }
-            interprete = Interprete()
-            salida, errores_ejecucion = interprete.ejecutar(
-                ast, lineas=lineas, lineas_con_error_semantico=lineas_con_error_semantico
-            )
-            errores_totales += errores_ejecucion
 
             # TABLA DE SIMBOLOS
             symbols = generar_tabla_simbolos(analizador)
@@ -69,6 +132,17 @@ def ejecutar():
             # AST (nodos aplanados + imagen con Graphviz)
             ast_nodes = generar_nodos_ast(ast)
             ast_image = generar_ast(ast_nodes)
+
+            # GENERACION DE CODIGO ARM64 Y EJECUCION CON QEMU
+            # solo si el programa quedo 100% limpio hasta aqui
+            if not errores_totales:
+                generador = GeneradorCodigo()
+                codigo_arm64, errores_codegen = generador.generar(ast)
+                errores_totales += errores_codegen
+
+                if codigo_arm64 is not None and not errores_codegen:
+                    salida, tiempo, errores_ejecucion = compilar_y_ejecutar(codigo_arm64)
+                    errores_totales += errores_ejecucion
 
         # Cada error trae un campo 'formato' con el texto de dos lineas
         for e in errores_totales:
@@ -80,7 +154,8 @@ def ejecutar():
             'symbols': symbols,
             'ast': ast_nodes,
             'ast_image': ast_image,
-            'tiempo': '0.002s'
+            'codigo_arm64': codigo_arm64,
+            'tiempo': tiempo,
         })
 
     except Exception as e:
