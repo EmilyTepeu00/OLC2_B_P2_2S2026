@@ -137,8 +137,15 @@
   font-family: var(--font-mono);
 }
 
-.editor {
+.editor-row {
   flex: 1.15;
+  min-height: 0;
+  display: flex;
+  gap: 16px;
+}
+
+.editor {
+  flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -146,6 +153,44 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   overflow: hidden;
+}
+
+.asm-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.asm-panel__body {
+  flex: 1;
+  overflow: auto;
+  padding: 14px 18px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.asm-panel__line {
+  display: flex;
+  gap: 12px;
+  white-space: pre;
+}
+
+.asm-panel__lineno {
+  flex-shrink: 0;
+  width: 32px;
+  text-align: right;
+  color: var(--text-faint);
+  user-select: none;
+}
+
+.asm-panel__code {
+  color: var(--text);
 }
 
 .editor__body {
@@ -410,6 +455,10 @@
 
 @media (max-width: 860px) {
   .lower {
+    flex-direction: column;
+  }
+
+  .editor-row {
     flex-direction: column;
   }
 }

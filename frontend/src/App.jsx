@@ -49,7 +49,7 @@ export default function App() {
   ])
   const [isRunning, setIsRunning] = useState(false)
   const [reportTab, setReportTab] = useState('errors')
-  const [result, setResult] = useState({ errors: [], symbols: [], ast: [], ast_image: '' })
+  const [result, setResult] = useState({ errors: [], symbols: [], ast: [], ast_image: '', asm: '' })
 
   const textareaRef = useRef(null)
   const gutterRef = useRef(null)
@@ -99,7 +99,7 @@ export default function App() {
     setSavedCode('fn main() {\n    \n}\n')
     setFileName('principal.ox')
     setConsoleLines([{ type: 'hint', text: '> Archivo nuevo creado.' }])
-    setResult({ errors: [], symbols: [], ast: [] })
+    setResult({ errors: [], symbols: [], ast: [], ast_image: '', asm: '' })
   }
 
   const handleAbrir = () => fileInputRef.current?.click()
@@ -150,6 +150,7 @@ export default function App() {
         symbols: data.symbols ?? [],
         ast: data.ast ?? [],
         ast_image: data.ast_image || '',
+        asm: data.codigo_arm64 || '',
       })
 
       if ((data.errores ?? []).length === 0) {
@@ -203,33 +204,56 @@ export default function App() {
       <div className={`run-pulse ${isRunning ? 'run-pulse--active' : ''}`} aria-hidden="true" />
 
       <main className="workspace">
-        <section className="editor" aria-label="Editor de codigo">
-          <div className="panel__label">
-            <span>Editor</span>
-            <span className="panel__label-sub">OxigenScript · {lineCount} lineas</span>
-          </div>
-          <div className="editor__body">
-            <div className="editor__gutter" ref={gutterRef}>
-              {Array.from({ length: lineCount }, (_, i) => i + 1).map((n) => (
-                <div key={n} className={`editor__gutter-line ${errorLines.has(n) ? 'editor__gutter-line--error' : ''}`}>
-                  {errorLines.has(n) && <span className="editor__gutter-dot" />}
-                  {n}
-                </div>
-              ))}
+        <div className="editor-row">
+          <section className="editor" aria-label="Editor de codigo">
+            <div className="panel__label">
+              <span>Editor</span>
+              <span className="panel__label-sub">OxigenScript · {lineCount} lineas</span>
             </div>
-            <textarea
-              ref={textareaRef}
-              className="editor__textarea"
-              value={code}
-              onChange={(e) => setCode(e.target.value)}
-              onScroll={handleScrollSync}
-              onKeyDown={handleKeyDown}
-              spellCheck={false}
-              autoCapitalize="off"
-              autoCorrect="off"
-            />
-          </div>
-        </section>
+            <div className="editor__body">
+              <div className="editor__gutter" ref={gutterRef}>
+                {Array.from({ length: lineCount }, (_, i) => i + 1).map((n) => (
+                  <div key={n} className={`editor__gutter-line ${errorLines.has(n) ? 'editor__gutter-line--error' : ''}`}>
+                    {errorLines.has(n) && <span className="editor__gutter-dot" />}
+                    {n}
+                  </div>
+                ))}
+              </div>
+              <textarea
+                ref={textareaRef}
+                className="editor__textarea"
+                value={code}
+                onChange={(e) => setCode(e.target.value)}
+                onScroll={handleScrollSync}
+                onKeyDown={handleKeyDown}
+                spellCheck={false}
+                autoCapitalize="off"
+                autoCorrect="off"
+              />
+            </div>
+          </section>
+
+          <section className="asm-panel" aria-label="Codigo ARM64 generado">
+            <div className="panel__label">
+              <span>Codigo ARM64 generado</span>
+              {result.asm && (
+                <span className="panel__label-sub">{result.asm.split('\n').length} lineas</span>
+              )}
+            </div>
+            <div className="asm-panel__body">
+              {result.asm ? (
+                result.asm.split('\n').map((line, i) => (
+                  <div key={i} className="asm-panel__line">
+                    <span className="asm-panel__lineno">{i + 1}</span>
+                    <span className="asm-panel__code">{line || ' '}</span>
+                  </div>
+                ))
+              ) : (
+                <EmptyState text="Aqui se mostrara el codigo ensamblador ARM64 generado por el compilador" />
+              )}
+            </div>
+          </section>
+        </div>
 
         <div className="lower">
           <div className="console" aria-label="Consola de salida">
