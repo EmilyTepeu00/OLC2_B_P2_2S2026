@@ -1,10 +1,17 @@
 # --- GENERADOR DE CODIGO ARM64 (AArch64) ---
 # Recorre el mismo AST que ya usa interpreter.py, pero en vez de ejecutar cada nodo, emite las instrucciones de ensamblador equivalentes
 
+import re
+
 SYSCALL_WRITE = 64
 SYSCALL_EXIT = 93
 
 TAMANO_SLOT = 16  # bytes reservados por variable escalar (simple sin empacar)
+
+# Marcadores de formato de println!: {} y {:?}
+MARCADOR = re.compile(r'(\{(?::\?)?\})')
+
+ESCAPES_CHAR = {'n': 10, 't': 9, 'r': 13, '0': 0, '\\': 92, "'": 39, '"': 34}
 
 
 class GeneradorCodigo:
@@ -17,6 +24,9 @@ class GeneradorCodigo:
         self._usa_salto_de_linea = False
         self._offsets_por_nodo = {}     # id(nodo 'let') -> offset unico en el stack frame
         self._formas_por_nodo = {}      # id(nodo 'let') -> [dim0, dim1, ...] si es arreglo
+        self._usa_imprimir_bool = False
+        self._usa_imprimir_char = False
+        self._tipos_funcion = {}        # nombre de funcion -> tipo de retorno (o None)
 
     def nueva_etiqueta(self, prefijo='L'):
         self._contador_etiquetas += 1
@@ -29,12 +39,15 @@ class GeneradorCodigo:
         self.errores = []
         self._usa_imprimir_entero = False
         self._usa_salto_de_linea = False
+        self._usa_imprimir_bool = False
+        self._usa_imprimir_char = False
         self._offsets_por_nodo = {}
         self._formas_por_nodo = {}
 
         programa = ast
         funciones = [d for d in programa[1] if d[0] == 'funcion']
         nombres_funciones = {f[1] for f in funciones}
+        self._tipos_funcion = {f[1]: (f[3] if isinstance(f[3], str) else None) for f in funciones}
 
         if 'main' not in nombres_funciones:
             self.errores.append({
@@ -60,6 +73,9 @@ class GeneradorCodigo:
             lineas.append('buffer_entero_fin:')
         if self._usa_salto_de_linea:
             lineas.append('salto_de_linea: .ascii "\\n"')
+        if self._usa_imprimir_bool:
+            lineas.append('texto_true: .ascii "true"')
+            lineas.append('texto_false: .ascii "false"')
         if self.datos:
             lineas.extend(self.datos)
         lineas.append('')
@@ -77,6 +93,10 @@ class GeneradorCodigo:
 
         if self._usa_imprimir_entero:
             lineas.append(self._rutina_imprimir_entero())
+        if self._usa_imprimir_bool:
+            lineas.append(self._rutina_imprimir_bool())
+        if self._usa_imprimir_char:
+            lineas.append(self._rutina_imprimir_char())
 
         lineas.append('')
 
@@ -135,6 +155,96 @@ class GeneradorCodigo:
             '    ret',
         ])
 
+    def _rutina_imprimir_bool(self):
+        # Entrada: x0 = 0 o 1. Escribe "true" o "false" (sin salto de linea)
+        return '\n'.join([
+            '',
+            'imprimir_bool:',
+            '    cbz x0, .Limprimir_bool_falso',
+            '    adr x1, texto_true',
+            '    mov x2, #4',
+            '    b .Limprimir_bool_escribir',
+            '.Limprimir_bool_falso:',
+            '    adr x1, texto_false',
+            '    mov x2, #5',
+            '.Limprimir_bool_escribir:',
+            '    mov x0, #1',
+            f'    mov x8, #{SYSCALL_WRITE}',
+            '    svc #0',
+            '    ret',
+        ])
+
+    def _rutina_imprimir_char(self):
+        # Entrada: x0 = punto de codigo Unicode, lo codifica en UTF-8 (1 a 4 bytes) y lo escribe
+        return '\n'.join([
+            '',
+            'imprimir_char:',
+            '    stp x29, x30, [sp, -32]!',
+            '    mov x29, sp',
+            '    mov x3, x0',
+            '    add x1, sp, #16',
+            '    cmp x3, #128',
+            '    b.hs .Limprimir_char_dos',
+            '    strb w3, [x1]',
+            '    mov x2, #1',
+            '    b .Limprimir_char_escribir',
+            '.Limprimir_char_dos:',
+            '    cmp x3, #2048',
+            '    b.hs .Limprimir_char_tres',
+            '    lsr x4, x3, #6',
+            '    mov w5, #0xC0',
+            '    orr w4, w4, w5',
+            '    strb w4, [x1]',
+            '    and w4, w3, #0x3F',
+            '    mov w5, #0x80',
+            '    orr w4, w4, w5',
+            '    strb w4, [x1, #1]',
+            '    mov x2, #2',
+            '    b .Limprimir_char_escribir',
+            '.Limprimir_char_tres:',
+            '    mov x6, #65536',
+            '    cmp x3, x6',
+            '    b.hs .Limprimir_char_cuatro',
+            '    lsr x4, x3, #12',
+            '    mov w5, #0xE0',
+            '    orr w4, w4, w5',
+            '    strb w4, [x1]',
+            '    lsr x4, x3, #6',
+            '    and w4, w4, #0x3F',
+            '    mov w5, #0x80',
+            '    orr w4, w4, w5',
+            '    strb w4, [x1, #1]',
+            '    and w4, w3, #0x3F',
+            '    orr w4, w4, w5',
+            '    strb w4, [x1, #2]',
+            '    mov x2, #3',
+            '    b .Limprimir_char_escribir',
+            '.Limprimir_char_cuatro:',
+            '    lsr x4, x3, #18',
+            '    mov w5, #0xF0',
+            '    orr w4, w4, w5',
+            '    strb w4, [x1]',
+            '    lsr x4, x3, #12',
+            '    and w4, w4, #0x3F',
+            '    mov w5, #0x80',
+            '    orr w4, w4, w5',
+            '    strb w4, [x1, #1]',
+            '    lsr x4, x3, #6',
+            '    and w4, w4, #0x3F',
+            '    orr w4, w4, w5',
+            '    strb w4, [x1, #2]',
+            '    and w4, w3, #0x3F',
+            '    orr w4, w4, w5',
+            '    strb w4, [x1, #3]',
+            '    mov x2, #4',
+            '.Limprimir_char_escribir:',
+            '    mov x0, #1',
+            f'    mov x8, #{SYSCALL_WRITE}',
+            '    svc #0',
+            '    ldp x29, x30, [sp], 32',
+            '    ret',
+        ])
+
     # --- FUNCIONES ---
 
     REGISTROS_PARAMETRO = ['x0', 'x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7']
@@ -161,13 +271,19 @@ class GeneradorCodigo:
 
         # Los primeros 8 parametros llegan en x0-x7 y se copian a su slot en el stack antes de generar el cuerpo 
         # para que el resto del codigo lo trate igual que cualquier otra variable
-        for i, parametro in enumerate(parametros):
+        indice_registro = 0
+        for parametro in parametros:
             offset = self._offsets_por_nodo[id(parametro)]
-            contexto['scopes'][0][parametro[0]] = {'offset': offset, 'forma': None}
-            if i < len(self.REGISTROS_PARAMETRO):
-                self._guardar_variable(self.REGISTROS_PARAMETRO[i], offset)
+            tipo = parametro[1] if isinstance(parametro[1], str) else None
+            contexto['scopes'][0][parametro[0]] = {'offset': offset, 'forma': None, 'tipo': tipo}
+            necesarios = 2 if tipo == 'String' else 1
+            if indice_registro + necesarios <= len(self.REGISTROS_PARAMETRO):
+                self._guardar_variable(self.REGISTROS_PARAMETRO[indice_registro], offset)
+                if tipo == 'String':
+                    self._guardar_variable(self.REGISTROS_PARAMETRO[indice_registro + 1], offset - 8)
             else:
-                self.texto.append(f'    # parametro "{parametro[0]}": mas de 8 parametros no soportado')
+                self.texto.append(f'    # parametro "{parametro[0]}": no caben en los registros x0-x7')
+            indice_registro += necesarios
 
         for sentencia in cuerpo:
             self._generar_sentencia(sentencia, contexto)
@@ -299,11 +415,22 @@ class GeneradorCodigo:
     def _cerrar_scope(self, contexto):
         contexto['scopes'].pop()
 
-    def _declarar_variable(self, nodo_let, contexto, string_len=None):
+    def _declarar_variable(self, nodo_let, contexto, tipo=None):
         offset = self._offsets_por_nodo[id(nodo_let)]
         forma = self._formas_por_nodo.get(id(nodo_let))
-        contexto['scopes'][-1][nodo_let[1]] = {'offset': offset, 'forma': forma, 'string_len': string_len}
+        contexto['scopes'][-1][nodo_let[1]] = {'offset': offset, 'forma': forma, 'tipo': tipo}
         return offset
+
+    def _guardar_segun_tipo(self, tipo, offset):
+        # Un String ocupa el slot completo: puntero en la mitad baja y largo en la alta
+        self._guardar_variable('x0', offset)
+        if tipo == 'String':
+            self._guardar_variable('x1', offset - 8)
+
+    def _cargar_segun_tipo(self, tipo, offset):
+        self._cargar_variable('x0', offset)
+        if tipo == 'String':
+            self._cargar_variable('x1', offset - 8)
 
     def _buscar_variable(self, nombre, contexto):
         # Del bloque mas interno hacia el mas externo
@@ -516,31 +643,44 @@ class GeneradorCodigo:
 
     def _generar_let(self, nodo, contexto):
         # nodo = ('let', nombre, tipo, valor, mutable)
+        tipo_declarado = nodo[2]
         valor = nodo[3]
 
         if valor is not None and valor[0] in ('array_literal', 'array_repeat'):
-            offset_elem0 = self._declarar_variable(nodo, contexto)
+            tipo_elemento = self._tipo_elemento_arreglo(tipo_declarado, valor, contexto)
+            offset_elem0 = self._declarar_variable(nodo, contexto, tipo=tipo_elemento)
             self._generar_inicializacion_arreglo(valor, offset_elem0, contexto)
             return
 
-        if valor is not None and valor[0] in ('string', 'string_from'):
-            # La variable guarda un puntero] al texto fijo en .data, igual que cualquier otro escalar
-            etiqueta, longitud = self._emitir_literal_string(self._texto_de_nodo_string(valor))
-            self.texto.append(f'    adr x0, {etiqueta}')
-            offset = self._declarar_variable(nodo, contexto, string_len=longitud)
-            self._guardar_variable('x0', offset)
-            return
+        # El tipo se calcula antes de declarar el nombre (let x = x + 1 usa el x anterior)
+        if isinstance(tipo_declarado, str):
+            tipo = tipo_declarado
+        elif valor is not None:
+            tipo = self._tipo_expresion(valor, contexto)
+        else:
+            tipo = None
 
         if valor is None:
-            # Sin valor inicial: se deja en 0
-            offset = self._declarar_variable(nodo, contexto)
+            # Sin valor inicial: valor por defecto (0, 0.0, false, "")
+            offset = self._declarar_variable(nodo, contexto, tipo=tipo)
             self._guardar_variable('xzr', offset)
+            if tipo == 'String':
+                self._guardar_variable('xzr', offset - 8)
             return
 
-        # El valor se evalua antes de declarar el nombre (let x = x + 1 usa el x anterior)
-        self._generar_expresion(valor, contexto)    # deja el valor en x0
-        offset = self._declarar_variable(nodo, contexto)
-        self._guardar_variable('x0', offset)
+        self._generar_expresion(valor, contexto)    # deja el valor en x0 (un String: puntero en x0 y largo en x1)
+        offset = self._declarar_variable(nodo, contexto, tipo=tipo)
+        self._guardar_segun_tipo(tipo, offset)
+
+    def _tipo_elemento_arreglo(self, tipo_declarado, valor, contexto):
+        # Tipo escalar de los elementos: sale de la anotacion [[T; n]; m] o del primer elemento del literal
+        actual = tipo_declarado
+        while isinstance(actual, tuple):
+            actual = actual[1]
+        if isinstance(actual, str):
+            return actual
+        planos = self._aplanar_valores(valor)
+        return self._tipo_expresion(planos[0], contexto) if planos else 'i32'
 
     def _generar_inicializacion_arreglo(self, valor, offset_elem0, contexto):
         # Los indices son constantes de compilacion (posicion dentro del literal ya aplanado) asi que se usa _guardar_variable directo por cada elemento
@@ -554,8 +694,8 @@ class GeneradorCodigo:
         valor = nodo[2]
 
         self._generar_expresion(valor, contexto)
-        offset = self._buscar_variable(nombre, contexto)['offset']
-        self._guardar_variable('x0', offset)
+        info = self._buscar_variable(nombre, contexto)
+        self._guardar_segun_tipo(info['tipo'], info['offset'])
 
     def _generar_asignar_indice(self, nodo, contexto):
         # nodo = ('asignar_indice', base, indice, valor)
@@ -578,24 +718,106 @@ class GeneradorCodigo:
 
     # --- EXPRESIONES (dejan el resultado en x0) ---
 
+    def _cargar_inmediato(self, registro, valor):
+        # mov solo codifica 16 bits (o su negado), un valor mas grande se arma por partes de 16 bits
+        if 0 <= valor <= 0xFFFF or -0x10000 <= valor < 0:
+            self.texto.append(f'    mov {registro}, #{valor}')
+            return
+        bits = valor & 0xFFFFFFFFFFFFFFFF
+        primero = True
+        for i in range(4):
+            parte = (bits >> (16 * i)) & 0xFFFF
+            if parte == 0:
+                continue
+            desplazamiento = f', lsl #{16 * i}' if i else ''
+            instruccion = 'movz' if primero else 'movk'
+            self.texto.append(f'    {instruccion} {registro}, #{parte}{desplazamiento}')
+            primero = False
+
+    def _punto_de_codigo(self, texto):
+        # El lexer entrega el contenido del char sin interpretar escapes: 'a' -> "a", '\n' -> "\\n"
+        if len(texto) == 2 and texto[0] == '\\':
+            return ESCAPES_CHAR.get(texto[1], ord(texto[1]))
+        return ord(texto[0]) if texto else 0
+
+    def _tipo_expresion(self, nodo, contexto):
+        # Tipo de una expresion: 'i32', 'f64', 'bool', 'char', 'String' o None
+        tipo = nodo[0]
+        if tipo == 'literal':
+            return 'f64' if isinstance(nodo[1], float) else 'i32'
+        if tipo == 'bool':
+            return 'bool'
+        if tipo == 'char':
+            return 'char'
+        if tipo in ('string', 'string_from'):
+            return 'String'
+        if tipo == 'var':
+            return self._buscar_variable(nodo[1], contexto)['tipo']
+        if tipo == 'array_access':
+            nombre, _ = self._descomponer_acceso(nodo)
+            if nombre is None:
+                return None
+            return self._buscar_variable(nombre, contexto)['tipo']
+        if tipo == 'unop':
+            return 'bool' if nodo[1] == '!' else self._tipo_expresion(nodo[2], contexto)
+        if tipo == 'binop':
+            op = nodo[1]
+            if op in ('==', '!=', '>', '>=', '<', '<=', '&&', '||'):
+                return 'bool'
+            izquierdo = self._tipo_expresion(nodo[2], contexto)
+            derecho = self._tipo_expresion(nodo[3], contexto)
+            if 'f64' in (izquierdo, derecho):
+                return 'f64'
+            if 'String' in (izquierdo, derecho):
+                return 'String'
+            return 'i32'
+        if tipo == 'llamada':
+            nombre = nodo[1]
+            if nombre in ('len', 'random'):
+                return 'i32'
+            if nombre in ('typeof', 'to_uppercase', 'to_lowercase', 'replace'):
+                return 'String'
+            if nombre == 'contains':
+                return 'bool'
+            return self._tipos_funcion.get(nombre)
+        return None
+
     def _generar_expresion(self, nodo, contexto):
         tipo = nodo[0]
 
         if tipo == 'literal':
-            self.texto.append(f'    mov x0, #{nodo[1]}')
+            if isinstance(nodo[1], float):
+                self.texto.append('    # literal f64 no soportado')
+            else:
+                self._cargar_inmediato('x0', nodo[1])
         elif tipo == 'bool':
             self.texto.append(f'    mov x0, #{1 if nodo[1] else 0}')
+        elif tipo == 'char':
+            self._cargar_inmediato('x0', self._punto_de_codigo(nodo[1]))
+        elif tipo in ('string', 'string_from'):
+            etiqueta, longitud = self._emitir_literal_string(self._texto_de_nodo_string(nodo))
+            self.texto.append(f'    adr x0, {etiqueta}')
+            self._cargar_inmediato('x1', longitud)
         elif tipo == 'var':
             nombre = nodo[1]
             info = self._buscar_variable(nombre, contexto)
             if info['forma'] is not None:
-                self.texto.append(f'    # "{nombre}" es un arreglo, imprimir/usar el arreglo completo aun no esta')
+                self.texto.append(f'    # "{nombre}" es un arreglo, usar el arreglo completo como valor no esta soportado')
                 return
-            self._cargar_variable('x0', info['offset'])
+            self._cargar_segun_tipo(info['tipo'], info['offset'])
+        elif tipo == 'unop':
+            op = nodo[1]
+            self._generar_expresion(nodo[2], contexto)
+            if op == '!':
+                self.texto.append('    eor x0, x0, #1')
+            elif op == '-':
+                self.texto.append('    neg x0, x0')
+            else:
+                self.texto.append(f'    # operador unario "{op}"')
         elif tipo == 'array_access':
             nombre, indices = self._descomponer_acceso(nodo)
             if nombre is None:
-                self.texto.append('    # array_access: forma de acceso no esta')
+                self.texto.append('    # array_access: forma de acceso no soportada')
                 return
             info = self._buscar_variable(nombre, contexto)
             if info['forma'] is None:
@@ -615,6 +837,11 @@ class GeneradorCodigo:
         op = nodo[1]
         izquierda = nodo[2]
         derecha = nodo[3]
+
+        tipos_operandos = (self._tipo_expresion(izquierda, contexto), self._tipo_expresion(derecha, contexto))
+        if 'String' in tipos_operandos or 'f64' in tipos_operandos:
+            self.texto.append(f'    # operador "{op}" sobre {tipos_operandos[0]} y {tipos_operandos[1]} no soportado')
+            return
 
         operadores_aritmeticos = {'+', '-', '*', '/', '%'}
         operadores_relacionales = {
@@ -695,16 +922,11 @@ class GeneradorCodigo:
         argumentos = nodo[2]
 
         if nombre == 'len':
-            receptor = argumentos[0] if argumentos else None
-            if receptor is not None and receptor[0] == 'var':
-                info = self._buscar_variable(receptor[1], contexto)
-                if info['forma'] is not None:
-                    self.texto.append(f'    mov x0, #{info["forma"][0]}')
-                    return
-                if info.get('string_len') is not None:
-                    self.texto.append(f'    mov x0, #{info["string_len"]}')
-                    return
-            self.texto.append('    # .len(): solo soportado sobre una variable de arreglo o string conocida')
+            self._generar_len(argumentos, contexto)
+            return
+
+        if nombre == 'typeof':
+            self._generar_typeof(argumentos, contexto)
             return
 
         if nombre == 'println':
@@ -713,54 +935,137 @@ class GeneradorCodigo:
 
         self._generar_llamada_usuario(nombre, argumentos, contexto)
 
-    # --- IMPRESION: println! con texto literal + enteros + strings intercalados ---
+    def _generar_len(self, argumentos, contexto):
+        receptor = argumentos[0] if argumentos else None
+        if receptor is None:
+            self.texto.append('    # .len() sin receptor')
+            return
+        if receptor[0] == 'var':
+            info = self._buscar_variable(receptor[1], contexto)
+            if info['forma'] is not None:
+                self._cargar_inmediato('x0', info['forma'][0])
+                return
+        if self._tipo_expresion(receptor, contexto) == 'String':
+            self._generar_expresion(receptor, contexto)     # x0 = puntero, x1 = largo
+            self.texto.append('    mov x0, x1')
+            return
+        self.texto.append('    # .len(): receptor no soportado')
+
+    def _generar_typeof(self, argumentos, contexto):
+        # El tipo se conoce en tiempo de compilacion: se devuelve como un String literal
+        nombre_tipo = 'null'
+        if argumentos:
+            argumento = argumentos[0]
+            if argumento[0] == 'var' and self._buscar_variable(argumento[1], contexto)['forma'] is not None:
+                nombre_tipo = 'array'
+            else:
+                nombre_tipo = self._tipo_expresion(argumento, contexto) or 'null'
+        etiqueta, longitud = self._emitir_literal_string(nombre_tipo)
+        self.texto.append(f'    adr x0, {etiqueta}')
+        self._cargar_inmediato('x1', longitud)
+
+    # --- IMPRESION: println! con texto literal, enteros, bool, char, String y arreglos ---
 
     def _generar_println(self, argumentos, contexto):
-        # println!(x)                   -> un solo valor, sin texto alrededor
-        # println!("texto {} mas", x)   -> texto literal con "{}" por cada valor
-        if len(argumentos) >= 2 and argumentos[0][0] == 'string':
-            formato = argumentos[0][1]
-            valores = argumentos[1:]
-            partes = formato.split('{}')
-            if len(partes) - 1 != len(valores):
-                self.texto.append('    # println!: cantidad de "{}" no coincide con la cantidad de argumentos')
-            for i, parte in enumerate(partes):
-                if parte:
-                    self._generar_escribir_texto_literal(parte)
-                if i < len(valores):
-                    self._generar_escribir_valor(valores[i], contexto)
+        # println!()                    -> solo el salto de linea
+        # println!("a {} b {:?}", x, y) -> el texto literal con un valor por cada marcador
+        # println!(x, y)                -> los valores separados por un espacio
+        if not argumentos:
             self._generar_salto_de_linea()
             return
 
-        if len(argumentos) == 1:
-            self._generar_escribir_valor(argumentos[0], contexto)
+        primero = argumentos[0]
+        if primero[0] == 'string' and MARCADOR.search(primero[1]):
+            valores = list(argumentos[1:])
+            for pedazo in MARCADOR.split(primero[1]):
+                if not pedazo:
+                    continue
+                if MARCADOR.fullmatch(pedazo) and valores:
+                    self._generar_escribir_valor(valores.pop(0), contexto)
+                else:
+                    self._generar_escribir_texto_literal(pedazo)
             self._generar_salto_de_linea()
             return
 
-        self.texto.append('    # forma de println! no soportada')
+        for i, argumento in enumerate(argumentos):
+            if i > 0:
+                self._generar_escribir_texto_literal(' ')
+            self._generar_escribir_valor(argumento, contexto)
+        self._generar_salto_de_linea()
 
     def _generar_escribir_valor(self, nodo, contexto):
-        if self._es_tipo_string(nodo, contexto):
-            self._generar_escribir_string_nodo(nodo, contexto)
+        if nodo[0] in ('string', 'string_from'):
+            self._generar_escribir_texto_literal(self._texto_de_nodo_string(nodo))
+            return
+
+        if nodo[0] == 'var':
+            info = self._buscar_variable(nodo[1], contexto)
+            if info['forma'] is not None:
+                self._generar_imprimir_arreglo(info)
+                return
+
+        tipo = self._tipo_expresion(nodo, contexto)
+        if tipo == 'String':
+            self._generar_expresion(nodo, contexto)     # x0 = puntero, x1 = largo
+            self.texto.append('    mov x2, x1')
+            self.texto.append('    mov x1, x0')
+            self.texto.append('    mov x0, #1')
+            self.texto.append(f'    mov x8, #{SYSCALL_WRITE}')
+            self.texto.append('    svc #0')
+        elif tipo == 'f64':
+            self.texto.append('    # imprimir f64 no soportado')
         else:
             self._generar_expresion(nodo, contexto)     # deja el valor en x0
+            self._generar_imprimir_escalar_x0(tipo)
+
+    def _generar_imprimir_escalar_x0(self, tipo):
+        if tipo == 'bool':
+            self.texto.append('    bl imprimir_bool')
+            self._usa_imprimir_bool = True
+        elif tipo == 'char':
+            self.texto.append('    bl imprimir_char')
+            self._usa_imprimir_char = True
+        else:
             self.texto.append('    bl imprimir_entero')
             self._usa_imprimir_entero = True
 
+    def _generar_imprimir_arreglo(self, info):
+        # [a, b, c] o [[a, b], [c, d]]: la forma se conoce en tiempo de compilacion
+        # Se desenrolla leyendo cada elemento desde su posicion en el stack
+        forma = info['forma']
+        elemento = info['tipo']
+        base = info['offset']
+        strides = self._strides(forma)
+
+        def recorrer(nivel, desplazamiento):
+            self._generar_escribir_texto_literal('[')
+            for i in range(forma[nivel]):
+                if i > 0:
+                    self._generar_escribir_texto_literal(', ')
+                posicion = desplazamiento + i * strides[nivel]
+                if nivel < len(forma) - 1:
+                    recorrer(nivel + 1, posicion)
+                elif elemento == 'char':
+                    self._generar_escribir_texto_literal('"')
+                    self._cargar_variable('x0', base + posicion * 8)
+                    self._generar_imprimir_escalar_x0('char')
+                    self._generar_escribir_texto_literal('"')
+                else:
+                    self._cargar_variable('x0', base + posicion * 8)
+                    self._generar_imprimir_escalar_x0(elemento)
+            self._generar_escribir_texto_literal(']')
+
+        recorrer(0, 0)
+
     def _emitir_literal_string(self, texto):
         etiqueta = self.nueva_etiqueta('str')[1:]   # sin el punto: va al .data, no es una etiqueta local
-        escapado = texto.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
-        longitud = len(texto.encode('utf-8'))
+        datos = texto.encode('utf-8')
+        escapado = ''.join(
+            chr(b) if 32 <= b < 127 and b not in (34, 92) else f'\\{b:03o}'
+            for b in datos
+        )
         self.datos.append(f'{etiqueta}: .ascii "{escapado}"')
-        return etiqueta, longitud
-
-    def _es_tipo_string(self, nodo, contexto):
-        if nodo[0] in ('string', 'string_from'):
-            return True
-        if nodo[0] == 'var':
-            info = self._buscar_variable(nodo[1], contexto)
-            return info.get('string_len') is not None
-        return False
+        return etiqueta, len(datos)
 
     def _texto_de_nodo_string(self, nodo):
         return nodo[1] if nodo[0] == 'string' else nodo[1][1]
@@ -768,18 +1073,7 @@ class GeneradorCodigo:
     def _generar_escribir_texto_literal(self, texto):
         etiqueta, longitud = self._emitir_literal_string(texto)
         self.texto.append(f'    adr x1, {etiqueta}')
-        self.texto.append(f'    mov x2, #{longitud}')
-        self.texto.append('    mov x0, #1')
-        self.texto.append(f'    mov x8, #{SYSCALL_WRITE}')
-        self.texto.append('    svc #0')
-
-    def _generar_escribir_string_nodo(self, nodo, contexto):
-        if nodo[0] in ('string', 'string_from'):
-            self._generar_escribir_texto_literal(self._texto_de_nodo_string(nodo))
-            return
-        info = self._buscar_variable(nodo[1], contexto)
-        self._cargar_variable('x1', info['offset'])
-        self.texto.append(f'    mov x2, #{info["string_len"]}')
+        self._cargar_inmediato('x2', longitud)
         self.texto.append('    mov x0, #1')
         self.texto.append(f'    mov x8, #{SYSCALL_WRITE}')
         self.texto.append('    svc #0')
@@ -793,14 +1087,20 @@ class GeneradorCodigo:
         self._usa_salto_de_linea = True
 
     def _generar_llamada_usuario(self, nombre, argumentos, contexto):
-        # Cada argumento se evalua y se guarda en el stack de inmediato y al final se sacan en orden inverso para dejarlos en x0, x1, x2...
+        # Cada argumento se evalua y se guarda en el stack de inmediato (un String ocupa dos entradas: puntero y largo) 
+        # y al final se sacan en orden inverso para dejarlos en x0, x1, x2...
+        total = 0
         for argumento in argumentos:
             self._generar_expresion(argumento, contexto)
             self.texto.append('    str x0, [sp, -16]!')
+            total += 1
+            if self._tipo_expresion(argumento, contexto) == 'String':
+                self.texto.append('    str x1, [sp, -16]!')
+                total += 1
 
-        for i in reversed(range(len(argumentos))):
-            if i < len(self.REGISTROS_PARAMETRO):
-                self.texto.append(f'    ldr {self.REGISTROS_PARAMETRO[i]}, [sp], 16')
+        for k in reversed(range(total)):
+            if k < len(self.REGISTROS_PARAMETRO):
+                self.texto.append(f'    ldr {self.REGISTROS_PARAMETRO[k]}, [sp], 16')
             else:
                 self.texto.append('    add sp, sp, #16')
 

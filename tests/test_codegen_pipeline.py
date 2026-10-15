@@ -259,7 +259,7 @@ if exito:
     print(f'Stdout: {resultado.stdout!r}')
     print(f'Stderr: {resultado.stderr!r}')
 
-    esperado = '42\n7\n100\n11\n3\n2\n1\n0\n1\n27\n1\n10\n2\n1\n6\n0\n0\n1\n2\n1\n3\n4\n2\n6\n999\n200\n7\n120\n10\n50\n30\n999\n5\n7\n7\n1\n6\n99\n2\n3\n8\n77\nHola Mundo desde Rust\nCadena: Hola Mundo desde Rust\nLongitud: 21\n3 y 4\nsin nada que sustituir\n'
+    esperado = '42\n7\n100\n11\n3\n2\ntrue\nfalse\ntrue\n27\n1\n10\n2\n1\n6\n0\n0\n1\n2\n1\n3\n4\n2\n6\n999\n200\n7\n120\n10\n50\n30\n999\n5\n7\n7\n1\n6\n99\n2\n3\n8\n77\nHola Mundo desde Rust\nCadena: Hola Mundo desde Rust\nLongitud: 21\n3 y 4\nsin nada que sustituir\n'
     if resultado.stdout == esperado and resultado.returncode == 0:
         print('\nOK: la salida coincide con lo esperado (42 / 7 / 100)')
     else:
