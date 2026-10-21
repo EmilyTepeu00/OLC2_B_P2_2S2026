@@ -2,6 +2,7 @@
 # Recorre el mismo AST que ya usa interpreter.py, pero en vez de ejecutar cada nodo, emite las instrucciones de ensamblador equivalentes
 
 import re
+import struct
 
 SYSCALL_WRITE = 64
 SYSCALL_EXIT = 93
@@ -26,7 +27,9 @@ class GeneradorCodigo:
         self._formas_por_nodo = {}      # id(nodo 'let') -> [dim0, dim1, ...] si es arreglo
         self._usa_imprimir_bool = False
         self._usa_imprimir_char = False
+        self._usa_imprimir_f64 = False
         self._tipos_funcion = {}        # nombre de funcion -> tipo de retorno (o None)
+        self._tipos_parametros = {}     # nombre de funcion -> [tipo de cada parametro]
 
     def nueva_etiqueta(self, prefijo='L'):
         self._contador_etiquetas += 1
@@ -41,6 +44,7 @@ class GeneradorCodigo:
         self._usa_salto_de_linea = False
         self._usa_imprimir_bool = False
         self._usa_imprimir_char = False
+        self._usa_imprimir_f64 = False
         self._offsets_por_nodo = {}
         self._formas_por_nodo = {}
 
@@ -48,6 +52,9 @@ class GeneradorCodigo:
         funciones = [d for d in programa[1] if d[0] == 'funcion']
         nombres_funciones = {f[1] for f in funciones}
         self._tipos_funcion = {f[1]: (f[3] if isinstance(f[3], str) else None) for f in funciones}
+        self._tipos_parametros = {
+            f[1]: [p[1] if isinstance(p[1], str) else None for p in f[2]] for f in funciones
+        }
 
         if 'main' not in nombres_funciones:
             self.errores.append({
@@ -97,6 +104,8 @@ class GeneradorCodigo:
             lineas.append(self._rutina_imprimir_bool())
         if self._usa_imprimir_char:
             lineas.append(self._rutina_imprimir_char())
+        if self._usa_imprimir_f64:
+            lineas.append(self._rutina_imprimir_f64())
 
         lineas.append('')
 
@@ -245,6 +254,81 @@ class GeneradorCodigo:
             '    ret',
         ])
 
+    def _rutina_imprimir_f64(self):
+        # Entrada: x0 = patron de bits de un f64
+        # Escribe la parte entera con imprimir_entero, un punto y hasta 9 decimales sin ceros finales (siempre al menos uno: 3.0)
+        return '\n'.join([
+            '',
+            'imprimir_f64:',
+            '    stp x29, x30, [sp, -64]!',
+            '    mov x29, sp',
+            '    fmov d0, x0',
+            '    fmov d1, xzr',
+            '    fcmp d0, d1',
+            '    b.ge .Limprimir_f64_positivo',
+            '    fneg d0, d0',
+            '    str d0, [sp, #16]',
+            '    mov w1, #45',                          # signo menos
+            '    strb w1, [sp, #32]',
+            '    add x1, sp, #32',
+            '    mov x2, #1',
+            '    mov x0, #1',
+            f'    mov x8, #{SYSCALL_WRITE}',
+            '    svc #0',
+            '    ldr d0, [sp, #16]',
+            '.Limprimir_f64_positivo:',
+            '    fcvtzs x9, d0',                        # x9 = parte entera
+            '    scvtf d1, x9',
+            '    fsub d2, d0, d1',                      # d2 = parte fraccionaria
+            '    movz x10, #0xCA00',
+            '    movk x10, #0x3B9A, lsl #16',           # x10 = 1000000000
+            '    scvtf d3, x10',
+            '    fmul d2, d2, d3',
+            '    fcvtns x11, d2',                       # x11 = fraccion redondeada a 9 digitos
+            '    cmp x11, x10',
+            '    b.lt .Limprimir_f64_sin_acarreo',
+            '    add x9, x9, #1',                       # la fraccion se redondeo a 1.000000000
+            '    mov x11, #0',
+            '.Limprimir_f64_sin_acarreo:',
+            '    str x11, [sp, #24]',
+            '    mov x0, x9',
+            '    bl imprimir_entero',
+            '    ldr x11, [sp, #24]',
+            '    mov w12, #46',                         # punto decimal en la posicion 0 del buffer
+            '    strb w12, [sp, #32]',
+            '    mov x12, #10',
+            '    mov x13, #9',
+            '.Limprimir_f64_digitos:',
+            '    udiv x14, x11, x12',
+            '    msub x15, x14, x12, x11',
+            '    add x15, x15, #48',
+            '    add x16, sp, #32',
+            '    strb w15, [x16, x13]',
+            '    mov x11, x14',
+            '    sub x13, x13, #1',
+            '    cmp x13, #1',
+            '    b.ge .Limprimir_f64_digitos',
+            '    mov x13, #10',                         # largo del buffer: punto + 9 digitos
+            '.Limprimir_f64_recorte:',
+            '    cmp x13, #2',
+            '    b.le .Limprimir_f64_escribir',
+            '    add x16, sp, #32',
+            '    sub x17, x13, #1',
+            '    ldrb w15, [x16, x17]',
+            '    cmp w15, #48',
+            '    b.ne .Limprimir_f64_escribir',
+            '    mov x13, x17',
+            '    b .Limprimir_f64_recorte',
+            '.Limprimir_f64_escribir:',
+            '    add x1, sp, #32',
+            '    mov x2, x13',
+            '    mov x0, #1',
+            f'    mov x8, #{SYSCALL_WRITE}',
+            '    svc #0',
+            '    ldp x29, x30, [sp], 64',
+            '    ret',
+        ])
+
     # --- FUNCIONES ---
 
     REGISTROS_PARAMETRO = ['x0', 'x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7']
@@ -267,6 +351,7 @@ class GeneradorCodigo:
             'scopes': [{}],
             'bucles': [],
             'etiqueta_fin_funcion': self.nueva_etiqueta('fin_funcion'),
+            'tipo_retorno': self._tipos_funcion.get(nombre),
         }
 
         # Los primeros 8 parametros llegan en x0-x7 y se copian a su slot en el stack antes de generar el cuerpo 
@@ -637,6 +722,7 @@ class GeneradorCodigo:
         valor = nodo[1]
         if valor is not None:
             self._generar_expresion(valor, contexto)
+            self._convertir_a_tipo(self._tipo_expresion(valor, contexto), contexto.get('tipo_retorno'))
         self.texto.append(f'    b {contexto["etiqueta_fin_funcion"]}')
 
     # --- LET / ASIGNACIONES ---
@@ -649,7 +735,7 @@ class GeneradorCodigo:
         if valor is not None and valor[0] in ('array_literal', 'array_repeat'):
             tipo_elemento = self._tipo_elemento_arreglo(tipo_declarado, valor, contexto)
             offset_elem0 = self._declarar_variable(nodo, contexto, tipo=tipo_elemento)
-            self._generar_inicializacion_arreglo(valor, offset_elem0, contexto)
+            self._generar_inicializacion_arreglo(valor, offset_elem0, contexto, tipo_elemento)
             return
 
         # El tipo se calcula antes de declarar el nombre (let x = x + 1 usa el x anterior)
@@ -669,6 +755,7 @@ class GeneradorCodigo:
             return
 
         self._generar_expresion(valor, contexto)    # deja el valor en x0 (un String: puntero en x0 y largo en x1)
+        self._convertir_a_tipo(self._tipo_expresion(valor, contexto), tipo)
         offset = self._declarar_variable(nodo, contexto, tipo=tipo)
         self._guardar_segun_tipo(tipo, offset)
 
@@ -682,10 +769,11 @@ class GeneradorCodigo:
         planos = self._aplanar_valores(valor)
         return self._tipo_expresion(planos[0], contexto) if planos else 'i32'
 
-    def _generar_inicializacion_arreglo(self, valor, offset_elem0, contexto):
+    def _generar_inicializacion_arreglo(self, valor, offset_elem0, contexto, tipo_elemento=None):
         # Los indices son constantes de compilacion (posicion dentro del literal ya aplanado) asi que se usa _guardar_variable directo por cada elemento
         for i, elemento in enumerate(self._aplanar_valores(valor)):
             self._generar_expresion(elemento, contexto)
+            self._convertir_a_tipo(self._tipo_expresion(elemento, contexto), tipo_elemento)
             self._guardar_variable('x0', offset_elem0 + i * 8)
 
     def _generar_asignar(self, nodo, contexto):
@@ -695,6 +783,7 @@ class GeneradorCodigo:
 
         self._generar_expresion(valor, contexto)
         info = self._buscar_variable(nombre, contexto)
+        self._convertir_a_tipo(self._tipo_expresion(valor, contexto), info['tipo'])
         self._guardar_segun_tipo(info['tipo'], info['offset'])
 
     def _generar_asignar_indice(self, nodo, contexto):
@@ -711,6 +800,7 @@ class GeneradorCodigo:
             return
 
         self._generar_expresion(valor, contexto)      # x0 = valor a guardar
+        self._convertir_a_tipo(self._tipo_expresion(valor, contexto), info['tipo'])
         self.texto.append('    str x0, [sp, -16]!')   # se protege el valor mientras se calcula la direccion
         self._generar_direccion_arreglo(info['offset'], indices, info['forma'], contexto)   # x1 = direccion real
         self.texto.append('    ldr x0, [sp], 16')
@@ -733,6 +823,16 @@ class GeneradorCodigo:
             instruccion = 'movz' if primero else 'movk'
             self.texto.append(f'    {instruccion} {registro}, #{parte}{desplazamiento}')
             primero = False
+
+    def _convertir_a_tipo(self, tipo_origen, tipo_destino):
+        # x0 trae un valor de tipo_origen. Un i32 que se usa como f64 se convierte al patron de bits del double
+        if tipo_destino == 'f64' and tipo_origen == 'i32':
+            self.texto.append('    scvtf d0, x0')
+            self.texto.append('    fmov x0, d0')
+
+    def _generar_expresion_como_f64(self, nodo, contexto):
+        self._generar_expresion(nodo, contexto)
+        self._convertir_a_tipo(self._tipo_expresion(nodo, contexto), 'f64')
 
     def _punto_de_codigo(self, texto):
         # El lexer entrega el contenido del char sin interpretar escapes: 'a' -> "a", '\n' -> "\\n"
@@ -787,7 +887,8 @@ class GeneradorCodigo:
 
         if tipo == 'literal':
             if isinstance(nodo[1], float):
-                self.texto.append('    # literal f64 no soportado')
+                bits = struct.unpack('<Q', struct.pack('<d', nodo[1]))[0]
+                self._cargar_inmediato('x0', bits)
             else:
                 self._cargar_inmediato('x0', nodo[1])
         elif tipo == 'bool':
@@ -811,7 +912,12 @@ class GeneradorCodigo:
             if op == '!':
                 self.texto.append('    eor x0, x0, #1')
             elif op == '-':
-                self.texto.append('    neg x0, x0')
+                if self._tipo_expresion(nodo[2], contexto) == 'f64':
+                    self.texto.append('    fmov d0, x0')
+                    self.texto.append('    fneg d0, d0')
+                    self.texto.append('    fmov x0, d0')
+                else:
+                    self.texto.append('    neg x0, x0')
             else:
                 self.texto.append(f'    # operador unario "{op}"')
         elif tipo == 'array_access':
@@ -839,8 +945,12 @@ class GeneradorCodigo:
         derecha = nodo[3]
 
         tipos_operandos = (self._tipo_expresion(izquierda, contexto), self._tipo_expresion(derecha, contexto))
-        if 'String' in tipos_operandos or 'f64' in tipos_operandos:
+        if 'String' in tipos_operandos:
             self.texto.append(f'    # operador "{op}" sobre {tipos_operandos[0]} y {tipos_operandos[1]} no soportado')
+            return
+
+        if 'f64' in tipos_operandos:
+            self._generar_binop_f64(op, izquierda, derecha, contexto)
             return
 
         operadores_aritmeticos = {'+', '-', '*', '/', '%'}
@@ -879,6 +989,37 @@ class GeneradorCodigo:
         elif op == '%':
             self.texto.append('    sdiv x2, x0, x1')
             self.texto.append('    msub x0, x2, x1, x0')
+
+    def _generar_binop_f64(self, op, izquierda, derecha, contexto):
+        # Los dos lados se llevan a f64 (un i32 se promueve), el resultado aritmetico queda como bits en x0 y el relacional como 0/1
+        self._generar_expresion_como_f64(izquierda, contexto)
+        self.texto.append('    str x0, [sp, -16]!')
+        self._generar_expresion_como_f64(derecha, contexto)
+        self.texto.append('    fmov d1, x0')
+        self.texto.append('    ldr x0, [sp], 16')
+        self.texto.append('    fmov d0, x0')
+
+        condiciones = {'==': 'eq', '!=': 'ne', '>': 'gt', '>=': 'ge', '<': 'mi', '<=': 'ls'}
+        if op in condiciones:
+            self.texto.append('    fcmp d0, d1')
+            self.texto.append(f'    cset x0, {condiciones[op]}')
+            return
+
+        if op == '+':
+            self.texto.append('    fadd d0, d0, d1')
+        elif op == '-':
+            self.texto.append('    fsub d0, d0, d1')
+        elif op == '*':
+            self.texto.append('    fmul d0, d0, d1')
+        elif op == '/':
+            self.texto.append('    fdiv d0, d0, d1')
+        elif op == '%':
+            self.texto.append('    fdiv d2, d0, d1')
+            self.texto.append('    frintz d2, d2')
+            self.texto.append('    fmsub d0, d2, d1, d0')
+        else:
+            self.texto.append(f'    # operador "{op}" sobre f64')
+        self.texto.append('    fmov x0, d0')
 
     def _generar_binop_relacional(self, condicion, izquierda, derecha, contexto):
         self._generar_expresion(izquierda, contexto)
@@ -1012,8 +1153,6 @@ class GeneradorCodigo:
             self.texto.append('    mov x0, #1')
             self.texto.append(f'    mov x8, #{SYSCALL_WRITE}')
             self.texto.append('    svc #0')
-        elif tipo == 'f64':
-            self.texto.append('    # imprimir f64 no soportado')
         else:
             self._generar_expresion(nodo, contexto)     # deja el valor en x0
             self._generar_imprimir_escalar_x0(tipo)
@@ -1025,6 +1164,10 @@ class GeneradorCodigo:
         elif tipo == 'char':
             self.texto.append('    bl imprimir_char')
             self._usa_imprimir_char = True
+        elif tipo == 'f64':
+            self.texto.append('    bl imprimir_f64')
+            self._usa_imprimir_f64 = True
+            self._usa_imprimir_entero = True
         else:
             self.texto.append('    bl imprimir_entero')
             self._usa_imprimir_entero = True
@@ -1090,8 +1233,11 @@ class GeneradorCodigo:
         # Cada argumento se evalua y se guarda en el stack de inmediato (un String ocupa dos entradas: puntero y largo) 
         # y al final se sacan en orden inverso para dejarlos en x0, x1, x2...
         total = 0
-        for argumento in argumentos:
+        tipos_parametros = self._tipos_parametros.get(nombre, [])
+        for posicion, argumento in enumerate(argumentos):
             self._generar_expresion(argumento, contexto)
+            if posicion < len(tipos_parametros):
+                self._convertir_a_tipo(self._tipo_expresion(argumento, contexto), tipos_parametros[posicion])
             self.texto.append('    str x0, [sp, -16]!')
             total += 1
             if self._tipo_expresion(argumento, contexto) == 'String':
