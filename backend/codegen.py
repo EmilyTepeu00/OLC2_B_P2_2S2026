@@ -39,6 +39,7 @@ class GeneradorCodigo:
         self._usa_caja = False
         self._usa_split = False
         self._usa_imprimir_vec = False
+        self._usa_aleatorio = False
         self._tipos_funcion = {}        # nombre de funcion -> tipo de retorno (o None)
         self._tipos_parametros = {}     # nombre de funcion -> [tipo de cada parametro]
 
@@ -65,6 +66,7 @@ class GeneradorCodigo:
         self._usa_caja = False
         self._usa_split = False
         self._usa_imprimir_vec = False
+        self._usa_aleatorio = False
         self._offsets_por_nodo = {}
         self._formas_por_nodo = {}
 
@@ -151,6 +153,8 @@ class GeneradorCodigo:
             lineas.append(self._rutina_split_string())
         if self._usa_imprimir_vec:
             lineas.append(self._rutina_imprimir_vec_strings())
+        if self._usa_aleatorio:
+            lineas.append(self._rutina_aleatorio_rango())
 
         if self._usa_heap:
             lineas.append('')
@@ -818,6 +822,37 @@ class GeneradorCodigo:
         ]
         return '\n'.join(lineas)
 
+    def _rutina_aleatorio_rango(self):
+        # Entrada: x0 = minimo, x1 = maximo (ambos incluidos). Salida: x0 = entero aleatorio en [minimo, maximo]
+        # Los bytes aleatorios vienen de la llamada al sistema getrandom (278)
+        return '\n'.join([
+            '',
+            'aleatorio_rango:',
+            '    stp x29, x30, [sp, -48]!',
+            '    mov x29, sp',
+            '    stp x0, x1, [sp, #16]',
+            '    add x0, sp, #32',
+            '    mov x1, #8',
+            '    mov x2, #0',
+            '    mov x8, #278',
+            '    svc #0',
+            '    ldp x3, x4, [sp, #16]',
+            '    ldr x5, [sp, #32]',
+            '    sub x6, x4, x3',
+            '    add x6, x6, #1',
+            '    cmp x6, #0',
+            '    b.le .Laleatorio_sin_rango',
+            '    udiv x7, x5, x6',
+            '    msub x7, x7, x6, x5',
+            '    add x0, x3, x7',
+            '    b .Laleatorio_fin',
+            '.Laleatorio_sin_rango:',
+            '    mov x0, x3',
+            '.Laleatorio_fin:',
+            '    ldp x29, x30, [sp], 48',
+            '    ret',
+        ])
+
     # --- FUNCIONES ---
 
     REGISTROS_PARAMETRO = ['x0', 'x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7']
@@ -1371,6 +1406,8 @@ class GeneradorCodigo:
                 return 'bool'
             if nombre == 'split':
                 return 'Vec'
+            if nombre == 'random':
+                return 'i32'
             return self._tipos_funcion.get(nombre)
         return None
 
@@ -1626,11 +1663,64 @@ class GeneradorCodigo:
             self._generar_println(argumentos, contexto)
             return
 
+        if nombre == 'random':
+            self._generar_expresion(argumentos[0], contexto)
+            self.texto.append('    str x0, [sp, -16]!')
+            self._generar_expresion(argumentos[1], contexto)
+            self.texto.append('    mov x1, x0')
+            self.texto.append('    ldr x0, [sp], 16')
+            self.texto.append('    bl aleatorio_rango')
+            self._usa_aleatorio = True
+            return
+
+        if nombre in ('contains', 'reverse') and argumentos and argumentos[0][0] == 'var':
+            info = self._buscar_variable(argumentos[0][1], contexto)
+            if info['forma'] is not None:
+                self._generar_funcion_arreglo(nombre, info, argumentos, contexto)
+                return
+
         if nombre in ('contains', 'replace', 'to_uppercase', 'to_lowercase', 'split'):
             self._generar_funcion_string(nombre, argumentos, contexto)
             return
 
         self._generar_llamada_usuario(nombre, argumentos, contexto)
+
+    def _generar_funcion_arreglo(self, nombre, info, argumentos, contexto):
+        # La forma del arreglo se conoce al compilar, por eso el recorrido se desenrolla
+        forma = info['forma']
+        base = info['offset']
+        total = 1
+        for dimension in forma:
+            total *= dimension
+
+        if nombre == 'reverse':
+            # Invierte el orden de la primera dimension; cada bloque conserva el orden interno de sus elementos
+            bloque = total // forma[0]
+            for i in range(forma[0] // 2):
+                j = forma[0] - 1 - i
+                for k in range(bloque):
+                    offset_a = base + (i * bloque + k) * 8
+                    offset_b = base + (j * bloque + k) * 8
+                    self._cargar_variable('x0', offset_a)
+                    self._cargar_variable('x1', offset_b)
+                    self._guardar_variable('x1', offset_a)
+                    self._guardar_variable('x0', offset_b)
+            return
+
+        # contains(valor): recorre todos los elementos y compara con el valor
+        self._generar_expresion(argumentos[1], contexto)
+        self._convertir_a_tipo(self._tipo_expresion(argumentos[1], contexto), info['tipo'])
+        etiqueta_si = self.nueva_etiqueta('contains_si')
+        etiqueta_fin = self.nueva_etiqueta('contains_fin')
+        for posicion in range(total):
+            self._cargar_variable('x1', base + posicion * 8)
+            self.texto.append('    cmp x0, x1')
+            self.texto.append(f'    b.eq {etiqueta_si}')
+        self.texto.append('    mov x0, #0')
+        self.texto.append(f'    b {etiqueta_fin}')
+        self.texto.append(f'{etiqueta_si}:')
+        self.texto.append('    mov x0, #1')
+        self.texto.append(f'{etiqueta_fin}:')
 
     def _empujar_string(self):
         # Guarda el String que esta en x0/x1 (puntero y largo) en dos entradas del stack
