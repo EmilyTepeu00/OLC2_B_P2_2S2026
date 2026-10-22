@@ -34,6 +34,11 @@ class GeneradorCodigo:
         self._usa_concatenar = False
         self._usa_repetir = False
         self._usa_comparar_strings = False
+        self._usa_contiene = False
+        self._usa_reemplazar = False
+        self._usa_caja = False
+        self._usa_split = False
+        self._usa_imprimir_vec = False
         self._tipos_funcion = {}        # nombre de funcion -> tipo de retorno (o None)
         self._tipos_parametros = {}     # nombre de funcion -> [tipo de cada parametro]
 
@@ -55,6 +60,11 @@ class GeneradorCodigo:
         self._usa_concatenar = False
         self._usa_repetir = False
         self._usa_comparar_strings = False
+        self._usa_contiene = False
+        self._usa_reemplazar = False
+        self._usa_caja = False
+        self._usa_split = False
+        self._usa_imprimir_vec = False
         self._offsets_por_nodo = {}
         self._formas_por_nodo = {}
 
@@ -92,6 +102,11 @@ class GeneradorCodigo:
             lineas.append('buffer_entero_fin:')
         if self._usa_salto_de_linea:
             lineas.append('salto_de_linea: .ascii "\\n"')
+        if self._usa_imprimir_vec:
+            lineas.append('vec_texto_abre: .ascii "["')
+            lineas.append('vec_texto_cierra: .ascii "]"')
+            lineas.append('vec_texto_coma: .ascii ", "')
+            lineas.append('vec_texto_comilla: .ascii "\\042"')
         if self._usa_imprimir_bool:
             lineas.append('texto_true: .ascii "true"')
             lineas.append('texto_false: .ascii "false"')
@@ -126,6 +141,16 @@ class GeneradorCodigo:
             lineas.append(self._rutina_repetir_string())
         if self._usa_comparar_strings:
             lineas.append(self._rutina_comparar_strings())
+        if self._usa_contiene:
+            lineas.append(self._rutina_contiene_string())
+        if self._usa_reemplazar:
+            lineas.append(self._rutina_reemplazar_string())
+        if self._usa_caja:
+            lineas.append(self._rutina_cambiar_caja())
+        if self._usa_split:
+            lineas.append(self._rutina_split_string())
+        if self._usa_imprimir_vec:
+            lineas.append(self._rutina_imprimir_vec_strings())
 
         if self._usa_heap:
             lineas.append('')
@@ -480,6 +505,318 @@ class GeneradorCodigo:
             '    mov x0, #1',
             '    ret',
         ])
+
+    def _rutina_contiene_string(self):
+        # Entrada: x0/x1 = texto (puntero, largo), x2/x3 = subcadena
+        # Salida: x0 = 1 si aparece, 0 si no
+        return '\n'.join([
+            '',
+            'contiene_string:',
+            '    cbz x3, .Lcontiene_si',
+            '    sub x7, x1, x3',
+            '    mov x5, #0',
+            '.Lcontiene_ciclo:',
+            '    cmp x5, x7',
+            '    b.gt .Lcontiene_no',
+            '    mov x8, #0',
+            '.Lcontiene_comparar:',
+            '    cmp x8, x3',
+            '    b.ge .Lcontiene_si',
+            '    add x9, x5, x8',
+            '    ldrb w10, [x0, x9]',
+            '    ldrb w11, [x2, x8]',
+            '    cmp w10, w11',
+            '    b.ne .Lcontiene_siguiente',
+            '    add x8, x8, #1',
+            '    b .Lcontiene_comparar',
+            '.Lcontiene_siguiente:',
+            '    add x5, x5, #1',
+            '    b .Lcontiene_ciclo',
+            '.Lcontiene_si:',
+            '    mov x0, #1',
+            '    ret',
+            '.Lcontiene_no:',
+            '    mov x0, #0',
+            '    ret',
+        ])
+
+    def _rutina_reemplazar_string(self):
+        # Entrada: x0/x1 = texto, x2/x3 = parte a buscar, x4/x5 = reemplazo
+        # Salida: x0/x1 = cadena nueva en el heap (si la parte a buscar es vacia el texto queda igual)
+        return '\n'.join([
+            '',
+            'reemplazar_string:',
+            '    stp x29, x30, [sp, -96]!',
+            '    mov x29, sp',
+            '    stp x0, x1, [sp, #16]',
+            '    stp x2, x3, [sp, #32]',
+            '    stp x4, x5, [sp, #48]',
+            '    mov x6, #0',
+            '    mov x7, #0',
+            '    cbz x3, .Lreemplazar_reservar',
+            '.Lreemplazar_contar:',
+            '    sub x8, x1, x3',
+            '    cmp x7, x8',
+            '    b.gt .Lreemplazar_reservar',
+            '    mov x9, #0',
+            '.Lreemplazar_comparar_1:',
+            '    cmp x9, x3',
+            '    b.ge .Lreemplazar_coincide_1',
+            '    add x10, x7, x9',
+            '    ldrb w11, [x0, x10]',
+            '    ldrb w12, [x2, x9]',
+            '    cmp w11, w12',
+            '    b.ne .Lreemplazar_no_coincide_1',
+            '    add x9, x9, #1',
+            '    b .Lreemplazar_comparar_1',
+            '.Lreemplazar_coincide_1:',
+            '    add x6, x6, #1',
+            '    add x7, x7, x3',
+            '    b .Lreemplazar_contar',
+            '.Lreemplazar_no_coincide_1:',
+            '    add x7, x7, #1',
+            '    b .Lreemplazar_contar',
+            '.Lreemplazar_reservar:',
+            '    sub x8, x5, x3',
+            '    mul x8, x8, x6',
+            '    add x8, x8, x1',
+            '    str x8, [sp, #64]',
+            '    mov x0, x8',
+            '    bl reservar_heap',
+            '    str x0, [sp, #72]',
+            '    ldp x0, x1, [sp, #16]',
+            '    ldp x2, x3, [sp, #32]',
+            '    ldp x4, x5, [sp, #48]',
+            '    ldr x13, [sp, #72]',
+            '    mov x7, #0',
+            '    cbz x3, .Lreemplazar_resto',
+            '.Lreemplazar_llenar:',
+            '    sub x8, x1, x3',
+            '    cmp x7, x8',
+            '    b.gt .Lreemplazar_resto',
+            '    mov x9, #0',
+            '.Lreemplazar_comparar_2:',
+            '    cmp x9, x3',
+            '    b.ge .Lreemplazar_coincide_2',
+            '    add x10, x7, x9',
+            '    ldrb w11, [x0, x10]',
+            '    ldrb w12, [x2, x9]',
+            '    cmp w11, w12',
+            '    b.ne .Lreemplazar_no_coincide_2',
+            '    add x9, x9, #1',
+            '    b .Lreemplazar_comparar_2',
+            '.Lreemplazar_coincide_2:',
+            '    mov x9, #0',
+            '.Lreemplazar_copiar_nuevo:',
+            '    cmp x9, x5',
+            '    b.ge .Lreemplazar_fin_nuevo',
+            '    ldrb w11, [x4, x9]',
+            '    strb w11, [x13], #1',
+            '    add x9, x9, #1',
+            '    b .Lreemplazar_copiar_nuevo',
+            '.Lreemplazar_fin_nuevo:',
+            '    add x7, x7, x3',
+            '    b .Lreemplazar_llenar',
+            '.Lreemplazar_no_coincide_2:',
+            '    ldrb w11, [x0, x7]',
+            '    strb w11, [x13], #1',
+            '    add x7, x7, #1',
+            '    b .Lreemplazar_llenar',
+            '.Lreemplazar_resto:',
+            '    cmp x7, x1',
+            '    b.ge .Lreemplazar_fin',
+            '    ldrb w11, [x0, x7]',
+            '    strb w11, [x13], #1',
+            '    add x7, x7, #1',
+            '    b .Lreemplazar_resto',
+            '.Lreemplazar_fin:',
+            '    ldr x0, [sp, #72]',
+            '    ldr x1, [sp, #64]',
+            '    ldp x29, x30, [sp], 96',
+            '    ret',
+        ])
+
+    def _rutina_cambiar_caja(self):
+        # Entrada: x0/x1 = texto, x2 = 0 para mayusculas o 1 para minusculas (letras ASCII)
+        # Salida: x0/x1 = copia transformada en el heap
+        return '\n'.join([
+            '',
+            'cambiar_caja:',
+            '    stp x29, x30, [sp, -48]!',
+            '    mov x29, sp',
+            '    stp x0, x1, [sp, #16]',
+            '    str x2, [sp, #32]',
+            '    mov x0, x1',
+            '    bl reservar_heap',
+            '    ldp x4, x5, [sp, #16]',
+            '    ldr x6, [sp, #32]',
+            '    mov x9, #0',
+            '.Lcaja_ciclo:',
+            '    cmp x9, x5',
+            '    b.ge .Lcaja_fin',
+            '    ldrb w10, [x4, x9]',
+            '    cbnz x6, .Lcaja_a_minuscula',
+            '    sub w11, w10, #97',
+            '    cmp w11, #25',
+            '    b.hi .Lcaja_guardar',
+            '    sub w10, w10, #32',
+            '    b .Lcaja_guardar',
+            '.Lcaja_a_minuscula:',
+            '    sub w11, w10, #65',
+            '    cmp w11, #25',
+            '    b.hi .Lcaja_guardar',
+            '    add w10, w10, #32',
+            '.Lcaja_guardar:',
+            '    strb w10, [x0, x9]',
+            '    add x9, x9, #1',
+            '    b .Lcaja_ciclo',
+            '.Lcaja_fin:',
+            '    mov x1, x5',
+            '    ldp x29, x30, [sp], 48',
+            '    ret',
+        ])
+
+    def _rutina_split_string(self):
+        # Entrada: x0/x1 = texto, x2/x3 = separador
+        # Salida: x0 = bloque en el heap: [cantidad][relleno] seguido de (puntero, largo) por cada pieza
+        # Las piezas apuntan dentro del texto original (no se copian)
+        return '\n'.join([
+            '',
+            'split_string:',
+            '    stp x29, x30, [sp, -80]!',
+            '    mov x29, sp',
+            '    stp x0, x1, [sp, #16]',
+            '    stp x2, x3, [sp, #32]',
+            '    mov x4, x0',
+            '    mov x5, #0',
+            '    mov x6, #1',
+            '    cbz x3, .Lsplit_reservar',
+            '.Lsplit_contar:',
+            '    sub x7, x1, x3',
+            '    cmp x5, x7',
+            '    b.gt .Lsplit_reservar',
+            '    mov x8, #0',
+            '.Lsplit_comparar_1:',
+            '    cmp x8, x3',
+            '    b.ge .Lsplit_coincide_1',
+            '    add x9, x5, x8',
+            '    ldrb w10, [x4, x9]',
+            '    ldrb w11, [x2, x8]',
+            '    cmp w10, w11',
+            '    b.ne .Lsplit_no_coincide_1',
+            '    add x8, x8, #1',
+            '    b .Lsplit_comparar_1',
+            '.Lsplit_coincide_1:',
+            '    add x6, x6, #1',
+            '    add x5, x5, x3',
+            '    b .Lsplit_contar',
+            '.Lsplit_no_coincide_1:',
+            '    add x5, x5, #1',
+            '    b .Lsplit_contar',
+            '.Lsplit_reservar:',
+            '    str x6, [sp, #48]',
+            '    lsl x0, x6, #4',
+            '    add x0, x0, #16',
+            '    bl reservar_heap',
+            '    str x0, [sp, #56]',
+            '    ldr x6, [sp, #48]',
+            '    str x6, [x0]',
+            '    ldp x4, x1, [sp, #16]',
+            '    ldp x2, x3, [sp, #32]',
+            '    add x12, x0, #16',
+            '    mov x5, #0',
+            '    mov x13, #0',
+            '    cbz x3, .Lsplit_ultima',
+            '.Lsplit_llenar:',
+            '    sub x7, x1, x3',
+            '    cmp x5, x7',
+            '    b.gt .Lsplit_ultima',
+            '    mov x8, #0',
+            '.Lsplit_comparar_2:',
+            '    cmp x8, x3',
+            '    b.ge .Lsplit_coincide_2',
+            '    add x9, x5, x8',
+            '    ldrb w10, [x4, x9]',
+            '    ldrb w11, [x2, x8]',
+            '    cmp w10, w11',
+            '    b.ne .Lsplit_no_coincide_2',
+            '    add x8, x8, #1',
+            '    b .Lsplit_comparar_2',
+            '.Lsplit_coincide_2:',
+            '    add x14, x4, x13',
+            '    sub x15, x5, x13',
+            '    stp x14, x15, [x12], #16',
+            '    add x5, x5, x3',
+            '    mov x13, x5',
+            '    b .Lsplit_llenar',
+            '.Lsplit_no_coincide_2:',
+            '    add x5, x5, #1',
+            '    b .Lsplit_llenar',
+            '.Lsplit_ultima:',
+            '    add x14, x4, x13',
+            '    sub x15, x1, x13',
+            '    stp x14, x15, [x12]',
+            '    ldr x0, [sp, #56]',
+            '    ldp x29, x30, [sp], 80',
+            '    ret',
+        ])
+
+    def _rutina_imprimir_vec_strings(self):
+        # Entrada: x0 = bloque de split_string. Escribe ["a", "b", "c"] (sin salto de linea)
+        escribir = lambda etiqueta, largo: [
+            f'    adr x1, {etiqueta}',
+            f'    mov x2, #{largo}',
+            '    mov x0, #1',
+            f'    mov x8, #{SYSCALL_WRITE}',
+            '    svc #0',
+        ]
+        lineas = [
+            '',
+            'imprimir_vec_strings:',
+            '    stp x29, x30, [sp, -48]!',
+            '    mov x29, sp',
+            '    str x0, [sp, #16]',
+            '    str xzr, [sp, #24]',
+        ]
+        lineas += escribir('vec_texto_abre', 1)
+        lineas += [
+            '.Limprimir_vec_ciclo:',
+            '    ldr x0, [sp, #16]',
+            '    ldr x4, [x0]',
+            '    ldr x5, [sp, #24]',
+            '    cmp x5, x4',
+            '    b.ge .Limprimir_vec_fin',
+            '    cbz x5, .Limprimir_vec_sin_coma',
+        ]
+        lineas += escribir('vec_texto_coma', 2)
+        lineas += ['.Limprimir_vec_sin_coma:']
+        lineas += escribir('vec_texto_comilla', 1)
+        lineas += [
+            '    ldr x0, [sp, #16]',
+            '    ldr x5, [sp, #24]',
+            '    lsl x5, x5, #4',
+            '    add x5, x5, #16',
+            '    add x5, x0, x5',
+            '    ldr x1, [x5]',
+            '    ldr x2, [x5, #8]',
+            '    mov x0, #1',
+            f'    mov x8, #{SYSCALL_WRITE}',
+            '    svc #0',
+        ]
+        lineas += escribir('vec_texto_comilla', 1)
+        lineas += [
+            '    ldr x5, [sp, #24]',
+            '    add x5, x5, #1',
+            '    str x5, [sp, #24]',
+            '    b .Limprimir_vec_ciclo',
+            '.Limprimir_vec_fin:',
+        ]
+        lineas += escribir('vec_texto_cierra', 1)
+        lineas += [
+            '    ldp x29, x30, [sp], 48',
+            '    ret',
+        ]
+        return '\n'.join(lineas)
 
     # --- FUNCIONES ---
 
@@ -1009,7 +1346,8 @@ class GeneradorCodigo:
             nombre, _ = self._descomponer_acceso(nodo)
             if nombre is None:
                 return None
-            return self._buscar_variable(nombre, contexto)['tipo']
+            tipo_base = self._buscar_variable(nombre, contexto)['tipo']
+            return 'String' if tipo_base == 'Vec' else tipo_base
         if tipo == 'unop':
             return 'bool' if nodo[1] == '!' else self._tipo_expresion(nodo[2], contexto)
         if tipo == 'binop':
@@ -1031,6 +1369,8 @@ class GeneradorCodigo:
                 return 'String'
             if nombre == 'contains':
                 return 'bool'
+            if nombre == 'split':
+                return 'Vec'
             return self._tipos_funcion.get(nombre)
         return None
 
@@ -1078,6 +1418,16 @@ class GeneradorCodigo:
                 self.texto.append('    # array_access: forma de acceso no soportada')
                 return
             info = self._buscar_variable(nombre, contexto)
+            if info['tipo'] == 'Vec' and len(indices) == 1:
+                # pieza i del bloque de split: puntero en x0 y largo en x1
+                self._generar_expresion(indices[0], contexto)
+                self.texto.append('    lsl x0, x0, #4')
+                self.texto.append('    add x0, x0, #16')
+                self._cargar_variable('x1', info['offset'])
+                self.texto.append('    add x2, x1, x0')
+                self.texto.append('    ldr x0, [x2]')
+                self.texto.append('    ldr x1, [x2, #8]')
+                return
             if info['forma'] is None:
                 self.texto.append(f'    # "{nombre}" no es un arreglo conocido por el codegen')
                 return
@@ -1276,7 +1626,65 @@ class GeneradorCodigo:
             self._generar_println(argumentos, contexto)
             return
 
+        if nombre in ('contains', 'replace', 'to_uppercase', 'to_lowercase', 'split'):
+            self._generar_funcion_string(nombre, argumentos, contexto)
+            return
+
         self._generar_llamada_usuario(nombre, argumentos, contexto)
+
+    def _empujar_string(self):
+        # Guarda el String que esta en x0/x1 (puntero y largo) en dos entradas del stack
+        self.texto.append('    str x0, [sp, -16]!')
+        self.texto.append('    str x1, [sp, -16]!')
+
+    def _sacar_string(self, registro_puntero, registro_largo):
+        self.texto.append(f'    ldr {registro_largo}, [sp], 16')
+        self.texto.append(f'    ldr {registro_puntero}, [sp], 16')
+
+    def _generar_funcion_string(self, nombre, argumentos, contexto):
+        # argumentos[0] es el receptor: el String sobre el que se llama el metodo
+        receptor = argumentos[0]
+        if self._tipo_expresion(receptor, contexto) != 'String':
+            self.texto.append(f'    # {nombre}(): receptor no soportado')
+            return
+
+        if nombre in ('to_uppercase', 'to_lowercase'):
+            self._generar_expresion(receptor, contexto)
+            self.texto.append(f'    mov x2, #{0 if nombre == "to_uppercase" else 1}')
+            self.texto.append('    bl cambiar_caja')
+            self._usa_caja = True
+            self._usa_heap = True
+            return
+
+        if nombre in ('contains', 'split'):
+            self._generar_expresion(receptor, contexto)
+            self._empujar_string()
+            self._generar_expresion(argumentos[1], contexto)
+            self.texto.append('    mov x2, x0')
+            self.texto.append('    mov x3, x1')
+            self._sacar_string('x0', 'x1')
+            if nombre == 'contains':
+                self.texto.append('    bl contiene_string')
+                self._usa_contiene = True
+            else:
+                self.texto.append('    bl split_string')
+                self._usa_split = True
+                self._usa_heap = True
+            return
+
+        # replace(buscar, nuevo)
+        self._generar_expresion(receptor, contexto)
+        self._empujar_string()
+        self._generar_expresion(argumentos[1], contexto)
+        self._empujar_string()
+        self._generar_expresion(argumentos[2], contexto)
+        self.texto.append('    mov x4, x0')
+        self.texto.append('    mov x5, x1')
+        self._sacar_string('x2', 'x3')
+        self._sacar_string('x0', 'x1')
+        self.texto.append('    bl reemplazar_string')
+        self._usa_reemplazar = True
+        self._usa_heap = True
 
     def _generar_len(self, argumentos, contexto):
         receptor = argumentos[0] if argumentos else None
@@ -1291,6 +1699,10 @@ class GeneradorCodigo:
         if self._tipo_expresion(receptor, contexto) == 'String':
             self._generar_expresion(receptor, contexto)     # x0 = puntero, x1 = largo
             self.texto.append('    mov x0, x1')
+            return
+        if self._tipo_expresion(receptor, contexto) == 'Vec':
+            self._generar_expresion(receptor, contexto)     # x0 = bloque, la cantidad esta en su primer campo
+            self.texto.append('    ldr x0, [x0]')
             return
         self.texto.append('    # .len(): receptor no soportado')
 
@@ -1348,7 +1760,11 @@ class GeneradorCodigo:
                 return
 
         tipo = self._tipo_expresion(nodo, contexto)
-        if tipo == 'String':
+        if tipo == 'Vec':
+            self._generar_expresion(nodo, contexto)     # x0 = bloque de split
+            self.texto.append('    bl imprimir_vec_strings')
+            self._usa_imprimir_vec = True
+        elif tipo == 'String':
             self._generar_expresion(nodo, contexto)     # x0 = puntero, x1 = largo
             self.texto.append('    mov x2, x1')
             self.texto.append('    mov x1, x0')
