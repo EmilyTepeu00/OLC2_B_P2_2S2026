@@ -7,6 +7,8 @@ import struct
 SYSCALL_WRITE = 64
 SYSCALL_EXIT = 93
 
+TAMANO_HEAP = 33554432  # 32 MB reservados en .bss para el heap de cadenas
+
 TAMANO_SLOT = 16  # bytes reservados por variable escalar (simple sin empacar)
 
 # Marcadores de formato de println!: {} y {:?}
@@ -28,6 +30,10 @@ class GeneradorCodigo:
         self._usa_imprimir_bool = False
         self._usa_imprimir_char = False
         self._usa_imprimir_f64 = False
+        self._usa_heap = False
+        self._usa_concatenar = False
+        self._usa_repetir = False
+        self._usa_comparar_strings = False
         self._tipos_funcion = {}        # nombre de funcion -> tipo de retorno (o None)
         self._tipos_parametros = {}     # nombre de funcion -> [tipo de cada parametro]
 
@@ -45,6 +51,10 @@ class GeneradorCodigo:
         self._usa_imprimir_bool = False
         self._usa_imprimir_char = False
         self._usa_imprimir_f64 = False
+        self._usa_heap = False
+        self._usa_concatenar = False
+        self._usa_repetir = False
+        self._usa_comparar_strings = False
         self._offsets_por_nodo = {}
         self._formas_por_nodo = {}
 
@@ -75,6 +85,8 @@ class GeneradorCodigo:
 
         lineas.append('.section .data')
         lineas.append('    .align 3')
+        if self._usa_heap:
+            lineas.append('heap_ptr: .quad heap_base')
         if self._usa_imprimir_entero:
             lineas.append('buffer_entero: .skip 24')
             lineas.append('buffer_entero_fin:')
@@ -106,6 +118,20 @@ class GeneradorCodigo:
             lineas.append(self._rutina_imprimir_char())
         if self._usa_imprimir_f64:
             lineas.append(self._rutina_imprimir_f64())
+        if self._usa_heap:
+            lineas.append(self._rutina_reservar_heap())
+        if self._usa_concatenar:
+            lineas.append(self._rutina_concatenar_strings())
+        if self._usa_repetir:
+            lineas.append(self._rutina_repetir_string())
+        if self._usa_comparar_strings:
+            lineas.append(self._rutina_comparar_strings())
+
+        if self._usa_heap:
+            lineas.append('')
+            lineas.append('.section .bss')
+            lineas.append('    .align 4')
+            lineas.append(f'heap_base: .skip {TAMANO_HEAP}')
 
         lineas.append('')
 
@@ -326,6 +352,132 @@ class GeneradorCodigo:
             f'    mov x8, #{SYSCALL_WRITE}',
             '    svc #0',
             '    ldp x29, x30, [sp], 64',
+            '    ret',
+        ])
+
+    def _rutina_reservar_heap(self):
+        # Entrada: x0 = bytes
+        # Salida: x0 = direccion del bloque (reserva secuencial, multiplos de 16)
+        return '\n'.join([
+            '',
+            'reservar_heap:',
+            '    add x0, x0, #15',
+            '    bic x0, x0, #15',
+            '    adr x1, heap_ptr',
+            '    ldr x2, [x1]',
+            '    add x3, x2, x0',
+            '    str x3, [x1]',
+            '    mov x0, x2',
+            '    ret',
+        ])
+
+    def _rutina_concatenar_strings(self):
+        # Entrada: x0/x1 = puntero y largo de a, x2/x3 = puntero y largo de b
+        # Salida: x0/x1 = puntero y largo de la cadena nueva a + b (en el heap)
+        return '\n'.join([
+            '',
+            'concatenar_strings:',
+            '    stp x29, x30, [sp, -48]!',
+            '    mov x29, sp',
+            '    stp x0, x1, [sp, #16]',
+            '    stp x2, x3, [sp, #32]',
+            '    add x0, x1, x3',
+            '    bl reservar_heap',
+            '    ldp x4, x5, [sp, #16]',
+            '    ldp x6, x7, [sp, #32]',
+            '    mov x9, x0',
+            '    mov x10, #0',
+            '.Lconcatenar_copiar_a:',
+            '    cmp x10, x5',
+            '    b.ge .Lconcatenar_inicio_b',
+            '    ldrb w11, [x4, x10]',
+            '    strb w11, [x9, x10]',
+            '    add x10, x10, #1',
+            '    b .Lconcatenar_copiar_a',
+            '.Lconcatenar_inicio_b:',
+            '    add x9, x9, x5',
+            '    mov x10, #0',
+            '.Lconcatenar_copiar_b:',
+            '    cmp x10, x7',
+            '    b.ge .Lconcatenar_fin',
+            '    ldrb w11, [x6, x10]',
+            '    strb w11, [x9, x10]',
+            '    add x10, x10, #1',
+            '    b .Lconcatenar_copiar_b',
+            '.Lconcatenar_fin:',
+            '    add x1, x5, x7',
+            '    ldp x29, x30, [sp], 48',
+            '    ret',
+        ])
+
+    def _rutina_repetir_string(self):
+        # Entrada: x0/x1 = puntero y largo, x2 = cantidad de repeticiones (negativa cuenta como 0)
+        # Salida: x0/x1 = puntero y largo de la cadena repetida (en el heap)
+        return '\n'.join([
+            '',
+            'repetir_string:',
+            '    stp x29, x30, [sp, -48]!',
+            '    mov x29, sp',
+            '    cmp x2, #0',
+            '    csel x2, xzr, x2, lt',
+            '    stp x0, x1, [sp, #16]',
+            '    str x2, [sp, #32]',
+            '    mul x0, x1, x2',
+            '    bl reservar_heap',
+            '    ldp x4, x5, [sp, #16]',
+            '    ldr x6, [sp, #32]',
+            '    mov x9, x0',
+            '    mov x12, #0',
+            '.Lrepetir_externo:',
+            '    cmp x12, x6',
+            '    b.ge .Lrepetir_fin',
+            '    mov x10, #0',
+            '.Lrepetir_interno:',
+            '    cmp x10, x5',
+            '    b.ge .Lrepetir_siguiente',
+            '    ldrb w11, [x4, x10]',
+            '    strb w11, [x9, x10]',
+            '    add x10, x10, #1',
+            '    b .Lrepetir_interno',
+            '.Lrepetir_siguiente:',
+            '    add x9, x9, x5',
+            '    add x12, x12, #1',
+            '    b .Lrepetir_externo',
+            '.Lrepetir_fin:',
+            '    mul x1, x5, x6',
+            '    ldp x29, x30, [sp], 48',
+            '    ret',
+        ])
+
+    def _rutina_comparar_strings(self):
+        # Entrada: x0/x1 = puntero y largo de a, x2/x3 = puntero y largo de b
+        # Salida: x0 = -1, 0 o 1 segun a < b, a == b o a > b (orden byte a byte, a igualdad de prefijo gana la mas larga)
+        return '\n'.join([
+            '',
+            'comparar_strings:',
+            '    mov x9, #0',
+            '.Lcomparar_ciclo:',
+            '    cmp x9, x1',
+            '    b.ge .Lcomparar_fin_a',
+            '    cmp x9, x3',
+            '    b.ge .Lcomparar_mayor',
+            '    ldrb w10, [x0, x9]',
+            '    ldrb w11, [x2, x9]',
+            '    cmp w10, w11',
+            '    b.lo .Lcomparar_menor',
+            '    b.hi .Lcomparar_mayor',
+            '    add x9, x9, #1',
+            '    b .Lcomparar_ciclo',
+            '.Lcomparar_fin_a:',
+            '    cmp x9, x3',
+            '    b.lt .Lcomparar_menor',
+            '    mov x0, #0',
+            '    ret',
+            '.Lcomparar_menor:',
+            '    mov x0, #-1',
+            '    ret',
+            '.Lcomparar_mayor:',
+            '    mov x0, #1',
             '    ret',
         ])
 
@@ -946,7 +1098,7 @@ class GeneradorCodigo:
 
         tipos_operandos = (self._tipo_expresion(izquierda, contexto), self._tipo_expresion(derecha, contexto))
         if 'String' in tipos_operandos:
-            self.texto.append(f'    # operador "{op}" sobre {tipos_operandos[0]} y {tipos_operandos[1]} no soportado')
+            self._generar_binop_string(op, izquierda, derecha, tipos_operandos, contexto)
             return
 
         if 'f64' in tipos_operandos:
@@ -989,6 +1141,56 @@ class GeneradorCodigo:
         elif op == '%':
             self.texto.append('    sdiv x2, x0, x1')
             self.texto.append('    msub x0, x2, x1, x0')
+
+    def _generar_binop_string(self, op, izquierda, derecha, tipos, contexto):
+        # Un String viaja como par (x0 = puntero, x1 = largo), por eso se guarda en el stack en dos entradas
+        tipo_izquierdo, tipo_derecho = tipos
+        condiciones = {'==': 'eq', '!=': 'ne', '<': 'lt', '<=': 'le', '>': 'gt', '>=': 'ge'}
+
+        if op == '*' and tipo_izquierdo == 'i32' and tipo_derecho == 'String':
+            self._generar_expresion(izquierda, contexto)
+            self.texto.append('    str x0, [sp, -16]!')
+            self._generar_expresion(derecha, contexto)      # x0 = puntero, x1 = largo
+            self.texto.append('    ldr x2, [sp], 16')       # x2 = repeticiones
+            self.texto.append('    bl repetir_string')
+            self._usa_repetir = True
+            self._usa_heap = True
+            return
+
+        if op == '*' and tipo_izquierdo == 'String' and tipo_derecho == 'i32':
+            self._generar_expresion(izquierda, contexto)
+            self.texto.append('    str x0, [sp, -16]!')
+            self.texto.append('    str x1, [sp, -16]!')
+            self._generar_expresion(derecha, contexto)
+            self.texto.append('    mov x2, x0')             # x2 = repeticiones
+            self.texto.append('    ldr x1, [sp], 16')
+            self.texto.append('    ldr x0, [sp], 16')
+            self.texto.append('    bl repetir_string')
+            self._usa_repetir = True
+            self._usa_heap = True
+            return
+
+        if tipo_izquierdo == 'String' and tipo_derecho == 'String' and (op == '+' or op in condiciones):
+            self._generar_expresion(izquierda, contexto)
+            self.texto.append('    str x0, [sp, -16]!')
+            self.texto.append('    str x1, [sp, -16]!')
+            self._generar_expresion(derecha, contexto)
+            self.texto.append('    mov x2, x0')             # x2/x3 = derecha
+            self.texto.append('    mov x3, x1')
+            self.texto.append('    ldr x1, [sp], 16')       # x0/x1 = izquierda
+            self.texto.append('    ldr x0, [sp], 16')
+            if op == '+':
+                self.texto.append('    bl concatenar_strings')
+                self._usa_concatenar = True
+                self._usa_heap = True
+            else:
+                self.texto.append('    bl comparar_strings')
+                self.texto.append('    cmp x0, #0')
+                self.texto.append(f'    cset x0, {condiciones[op]}')
+                self._usa_comparar_strings = True
+            return
+
+        self.texto.append(f'    # operador "{op}" sobre {tipo_izquierdo} y {tipo_derecho} no soportado')
 
     def _generar_binop_f64(self, op, izquierda, derecha, contexto):
         # Los dos lados se llevan a f64 (un i32 se promueve), el resultado aritmetico queda como bits en x0 y el relacional como 0/1
