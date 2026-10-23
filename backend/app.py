@@ -140,7 +140,7 @@ def ejecutar():
             # Resiliencia: los errores se reportan pero el programa se compila y ejecuta igual
             # Las sentencias con errores (variable/funcion no declarada, indice fuera de rango...) se omiten y las operaciones con tipos incompatibles producen None
             generador = GeneradorCodigo()
-            codigo_arm64, errores_codegen = generador.generar(ast, omitir=analizador.sentencias_omitidas)
+            codigo_arm64, errores_codegen = generador.generar(ast, omitir=analizador.sentencias_omitidas, codigo=codigo, lineas=lineas)
             errores_totales += errores_codegen
 
             if codigo_arm64:

@@ -46,15 +46,24 @@ class GeneradorCodigo:
         self._forma_retorno = {}        # nombre de funcion -> forma del arreglo que retorna (o None)
         self._elemento_retorno = {}     # nombre de funcion -> tipo de los elementos del arreglo que retorna
         self._omitir = set()            # id(sentencia) con error semantico fatal: no se genera
+        self._literales = {}            # texto -> etiqueta en .data (cada cadena se emite una sola vez)
+        self._lineas_fuente = []        # lineas del codigo fuente (para comentar el ASM con la sentencia original)
+        self._lineas_nodo = {}          # id(nodo) -> linea (viene del parser)
+        self._ultima_linea_comentada = None
 
     def nueva_etiqueta(self, prefijo='L'):
         self._contador_etiquetas += 1
         return f'.{prefijo}{self._contador_etiquetas}'
 
-    def generar(self, ast, omitir=None):
+    def generar(self, ast, omitir=None, codigo=None, lineas=None):
         """Punto de entrada. Devuelve (codigo_asm: str | None, errores: list)
-        omitir: ids de sentencias que el analisis semantico marcó con error fatal (no se emiten)"""
+        omitir: ids de sentencias que el analisis semantico marcó con error fatal (no se emiten)
+        codigo, lineas: codigo fuente y mapa id(nodo) -> linea, para comentar cada sentencia en el ASM"""
         self._omitir = set(omitir or ())
+        self._literales = {}
+        self._lineas_fuente = codigo.split('\n') if codigo else []
+        self._lineas_nodo = lineas or {}
+        self._ultima_linea_comentada = None
         self.texto = []
         self.datos = []
         self.errores = []
@@ -104,6 +113,11 @@ class GeneradorCodigo:
     def _ensamblar_archivo_final(self):
         lineas = []
 
+        lineas.append('# Codigo ARM64 (AArch64) generado por el compilador de OxigenNative')
+        lineas.append('# Convencion: x0-x7 parametros/retorno, x29 frame pointer, x30 link register,')
+        lineas.append('#             x9-x16 temporales; String = (puntero, largo); f64 = bits del double en x0')
+        lineas.append('')
+        lineas.append('# --- datos: literales de texto y buffers de la biblioteca de tiempo de ejecucion ---')
         lineas.append('.section .data')
         lineas.append('    .align 3')
         if self._usa_heap:
@@ -128,6 +142,7 @@ class GeneradorCodigo:
         lineas.append('.section .text')
         lineas.append('.global _start')
         lineas.append('')
+        lineas.append('# punto de entrada del ejecutable: llama a main y termina con exit(0)')
         lineas.append('_start:')
         lineas.append('    bl main')
         lineas.append('    mov x0, #0')
@@ -136,6 +151,9 @@ class GeneradorCodigo:
         lineas.append('')
         lineas.extend(self.texto)
 
+        lineas.append('# ' + '=' * 60)
+        lineas.append('# Biblioteca de tiempo de ejecucion (solo las rutinas que el programa usa)')
+        lineas.append('# ' + '=' * 60)
         if self._usa_imprimir_entero:
             lineas.append(self._rutina_imprimir_entero())
         if self._usa_imprimir_bool:
@@ -167,6 +185,7 @@ class GeneradorCodigo:
 
         if self._usa_heap:
             lineas.append('')
+            lineas.append(f'# heap: bloque de {TAMANO_HEAP} bytes, se reparte secuencialmente con reservar_heap')
             lineas.append('.section .bss')
             lineas.append('    .align 4')
             lineas.append(f'heap_base: .skip {TAMANO_HEAP}')
@@ -180,6 +199,7 @@ class GeneradorCodigo:
         # Convierte a decimal ASCII en buffer_entero (construyendo del final al principio) y lo escribe a stdout
         # (Sin salto de linea, eso lo agrega quien llama, una sola vez al final de todo el println!)
         return '\n'.join([
+            '# --- imprimir_entero: escribe en stdout el entero con signo de x0 ---',
             'imprimir_entero:',
             '    stp x29, x30, [sp, -32]!',
             '    mov x29, sp',
@@ -232,6 +252,7 @@ class GeneradorCodigo:
         # Entrada: x0 = 0 o 1. Escribe "true" o "false" (sin salto de linea)
         return '\n'.join([
             '',
+            '# --- imprimir_bool: escribe "true" o "false" segun x0 ---',
             'imprimir_bool:',
             '    cbz x0, .Limprimir_bool_falso',
             '    adr x1, texto_true',
@@ -251,6 +272,7 @@ class GeneradorCodigo:
         # Entrada: x0 = punto de codigo Unicode, lo codifica en UTF-8 (1 a 4 bytes) y lo escribe
         return '\n'.join([
             '',
+            '# --- imprimir_char: escribe el caracter Unicode de x0 codificado en UTF-8 ---',
             'imprimir_char:',
             '    stp x29, x30, [sp, -32]!',
             '    mov x29, sp',
@@ -323,6 +345,7 @@ class GeneradorCodigo:
         # Escribe la parte entera con imprimir_entero, un punto y hasta 9 decimales sin ceros finales (siempre al menos uno: 3.0)
         return '\n'.join([
             '',
+            '# --- imprimir_f64: escribe el f64 cuyos bits estan en x0 (hasta 9 decimales) ---',
             'imprimir_f64:',
             '    stp x29, x30, [sp, -64]!',
             '    mov x29, sp',
@@ -398,6 +421,7 @@ class GeneradorCodigo:
         # Salida: x0 = direccion del bloque (reserva secuencial, multiplos de 16)
         return '\n'.join([
             '',
+            '# --- reservar_heap: x0 = bytes -> x0 = direccion del bloque reservado en el heap ---',
             'reservar_heap:',
             '    add x0, x0, #15',
             '    bic x0, x0, #15',
@@ -414,6 +438,7 @@ class GeneradorCodigo:
         # Salida: x0/x1 = puntero y largo de la cadena nueva a + b (en el heap)
         return '\n'.join([
             '',
+            '# --- concatenar_strings: (x0,x1) + (x2,x3) -> (x0,x1) nueva cadena en el heap ---',
             'concatenar_strings:',
             '    stp x29, x30, [sp, -48]!',
             '    mov x29, sp',
@@ -453,6 +478,7 @@ class GeneradorCodigo:
         # Salida: x0/x1 = puntero y largo de la cadena repetida (en el heap)
         return '\n'.join([
             '',
+            '# --- repetir_string: (x0,x1) repetida x2 veces -> (x0,x1) ---',
             'repetir_string:',
             '    stp x29, x30, [sp, -48]!',
             '    mov x29, sp',
@@ -492,6 +518,7 @@ class GeneradorCodigo:
         # Salida: x0 = -1, 0 o 1 segun a < b, a == b o a > b (orden byte a byte, a igualdad de prefijo gana la mas larga)
         return '\n'.join([
             '',
+            '# --- comparar_strings: compara (x0,x1) con (x2,x3) -> x0 = -1, 0 o 1 ---',
             'comparar_strings:',
             '    mov x9, #0',
             '.Lcomparar_ciclo:',
@@ -524,6 +551,7 @@ class GeneradorCodigo:
         # Salida: x0 = 1 si aparece, 0 si no
         return '\n'.join([
             '',
+            '# --- contiene_string: x0 = 1 si (x2,x3) aparece dentro de (x0,x1) ---',
             'contiene_string:',
             '    cbz x3, .Lcontiene_si',
             '    sub x7, x1, x3',
@@ -558,6 +586,7 @@ class GeneradorCodigo:
         # Salida: x0/x1 = cadena nueva en el heap (si la parte a buscar es vacia el texto queda igual)
         return '\n'.join([
             '',
+            '# --- reemplazar_string: reemplaza (x2,x3) por (x4,x5) en (x0,x1) -> (x0,x1) ---',
             'reemplazar_string:',
             '    stp x29, x30, [sp, -96]!',
             '    mov x29, sp',
@@ -654,6 +683,7 @@ class GeneradorCodigo:
         # Salida: x0/x1 = copia transformada en el heap
         return '\n'.join([
             '',
+            '# --- cambiar_caja: mayusculas (x2=0) o minusculas (x2=1) de (x0,x1) ---',
             'cambiar_caja:',
             '    stp x29, x30, [sp, -48]!',
             '    mov x29, sp',
@@ -695,6 +725,7 @@ class GeneradorCodigo:
         # Las piezas apuntan dentro del texto original (no se copian)
         return '\n'.join([
             '',
+            '# --- split_string: divide (x0,x1) por el separador (x2,x3) -> x0 = bloque de piezas ---',
             'split_string:',
             '    stp x29, x30, [sp, -80]!',
             '    mov x29, sp',
@@ -785,6 +816,7 @@ class GeneradorCodigo:
         ]
         lineas = [
             '',
+            '# --- imprimir_vec_strings: escribe ["a", "b"] a partir del bloque de split en x0 ---',
             'imprimir_vec_strings:',
             '    stp x29, x30, [sp, -48]!',
             '    mov x29, sp',
@@ -836,6 +868,7 @@ class GeneradorCodigo:
         # Los bytes aleatorios vienen de la llamada al sistema getrandom (278)
         return '\n'.join([
             '',
+            '# --- aleatorio_rango: x0 = entero aleatorio en [x0, x1] (syscall getrandom) ---',
             'aleatorio_rango:',
             '    stp x29, x30, [sp, -48]!',
             '    mov x29, sp',
@@ -872,13 +905,23 @@ class GeneradorCodigo:
         parametros = nodo[2]
         cuerpo = nodo[4]
 
+        espacio = self._reservar_variables(cuerpo, parametros)
+
+        firma = ', '.join(f'{p[0]}: {self._texto_tipo(p[1])}' for p in parametros)
+        retorno = f' -> {self._texto_tipo(nodo[3])}' if nodo[3] is not None else ''
+        self.texto.append('# ' + '=' * 60)
+        self.texto.append(f'# fn {nombre}({firma}){retorno}')
+        self.texto.append(f'# Stack frame: [x29] = x29 anterior, [x29+8] = x30 (retorno),')
+        self.texto.append(f'#              {espacio} bytes de variables locales debajo de x29')
+        self.texto.append('# ' + '=' * 60)
         self.texto.append(f'{nombre}:')
-        # Prologo: guardamos frame pointer (x29) y link register (x30)
+        self.texto.append('    # prologo: guardar frame pointer (x29) y link register (x30)')
         self.texto.append('    stp x29, x30, [sp, -16]!')
         self.texto.append('    mov x29, sp')
-
-        espacio = self._reservar_variables(cuerpo, parametros)
+        if espacio:
+            self.texto.append(f'    # reservar {espacio} bytes para variables locales (multiplo de 16)')
         self._ajustar_sp('sub', espacio)
+        self._ultima_linea_comentada = None
 
         contexto = {
             'scopes': [{}],
@@ -890,8 +933,9 @@ class GeneradorCodigo:
 
         # Los primeros 8 parametros llegan en x0-x7 y se copian a su slot en el stack antes de generar el cuerpo 
         # para que el resto del codigo lo trate igual que cualquier otra variable
-        # Un arreglo llega como puntero a su elemento 0 y se copia completo al frame
-        self.texto.append('    # copia de parametros (x0-x7) a su espacio en el stack frame')
+        # Un arreglo llega como puntero a su elemento 0 y se copia completo al frame (paso por valor, como en Rust)
+        if parametros:
+            self.texto.append('    # copia de parametros (x0-x7) a su espacio en el stack frame')
         indice_registro = 0
         for parametro in parametros:
             offset = self._offsets_por_nodo[id(parametro)]
@@ -922,8 +966,8 @@ class GeneradorCodigo:
             self._generar_sentencia(sentencia, contexto)
 
         self.texto.append(f'{contexto["etiqueta_fin_funcion"]}:')
+        self.texto.append('    # epilogo: liberar variables locales, restaurar x29/x30 y volver al llamador')
         self._ajustar_sp('add', espacio)
-        # Epilogo: restauramos y retornamos
         self.texto.append('    ldp x29, x30, [sp], 16')
         self.texto.append('    ret')
         self.texto.append('')
@@ -968,6 +1012,11 @@ class GeneradorCodigo:
             acumulado *= dim
         strides.reverse()
         return strides
+
+    def _texto_tipo(self, tipo):
+        if isinstance(tipo, tuple) and tipo and tipo[0] == 'array':
+            return f'[{self._texto_tipo(tipo[1])}; {tipo[2]}]'
+        return str(tipo)
 
     def _forma_de_tipo(self, tipo):
         # ('array', ('array', 'i32', 3), 2)  ->  [2, 3]  (None si el tipo no es un arreglo)
@@ -1177,6 +1226,15 @@ class GeneradorCodigo:
         offset = self._offsets_por_nodo[id(nodo_let)]
         forma = self._formas_por_nodo.get(id(nodo_let))
         contexto['scopes'][-1][nodo_let[1]] = {'offset': offset, 'forma': forma, 'tipo': tipo}
+        if forma is not None:
+            dimensiones = 'x'.join(str(d) for d in forma)
+            self.texto.append(f'    # arreglo "{nodo_let[1]}" [{tipo}; {dimensiones}] row-major: '
+                              f'elemento i en x29 - {offset} - 8*i')
+        elif tipo == 'String':
+            self.texto.append(f'    # variable "{nodo_let[1]}" (String): puntero en [x29, #-{offset}], '
+                              f'largo en [x29, #-{offset - 8}]')
+        else:
+            self.texto.append(f'    # variable "{nodo_let[1]}" ({tipo}) en [x29, #-{offset}]')
         return offset
 
     def _guardar_segun_tipo(self, tipo, offset):
@@ -1244,6 +1302,7 @@ class GeneradorCodigo:
         inicio_texto = len(self.texto)
         cantidad_scopes = len(contexto['scopes'])
         cantidad_bucles = len(contexto['bucles'])
+        self._comentar_sentencia(sentencia)
         try:
             self._generar_sentencia_interna(sentencia, contexto)
         except Exception as error:
@@ -1253,6 +1312,17 @@ class GeneradorCodigo:
             self.texto.append(f'    # sentencia "{sentencia[0]}" no generada: {error}')
             if sentencia[0] == 'let':
                 self._generar_sentencia_omitida(sentencia, contexto)
+
+    def _comentar_sentencia(self, sentencia):
+        # "# [linea N] let x: i32 = 10;" antes del codigo de cada sentencia (una vez por linea)
+        linea = self._lineas_nodo.get(id(sentencia))
+        if not linea or linea == self._ultima_linea_comentada or linea > len(self._lineas_fuente):
+            return
+        self._ultima_linea_comentada = linea
+        texto = self._lineas_fuente[linea - 1].strip()
+        if len(texto) > 90:
+            texto = texto[:87] + '...'
+        self.texto.append(f'    # [linea {linea}] {texto}')
 
     def _generar_sentencia_omitida(self, sentencia, contexto):
         # Sentencia con error semantico: no se ejecuta, pero si declaraba una variable
@@ -2240,8 +2310,11 @@ class GeneradorCodigo:
         recorrer(0, 0)
 
     def _emitir_literal_string(self, texto):
-        etiqueta = self.nueva_etiqueta('str')[1:]   # sin el punto: va al .data, no es una etiqueta local
         datos = texto.encode('utf-8')
+        if texto in self._literales:
+            return self._literales[texto], len(datos)
+        etiqueta = self.nueva_etiqueta('str')[1:]   # sin el punto: va al .data, no es una etiqueta local
+        self._literales[texto] = etiqueta
         escapado = ''.join(
             chr(b) if 32 <= b < 127 and b not in (34, 92) else f'\\{b:03o}'
             for b in datos
