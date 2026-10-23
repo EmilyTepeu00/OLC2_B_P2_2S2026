@@ -42,13 +42,19 @@ class GeneradorCodigo:
         self._usa_aleatorio = False
         self._tipos_funcion = {}        # nombre de funcion -> tipo de retorno (o None)
         self._tipos_parametros = {}     # nombre de funcion -> [tipo de cada parametro]
+        self._formas_parametros = {}    # nombre de funcion -> [forma del parametro si es arreglo, o None]
+        self._forma_retorno = {}        # nombre de funcion -> forma del arreglo que retorna (o None)
+        self._elemento_retorno = {}     # nombre de funcion -> tipo de los elementos del arreglo que retorna
+        self._omitir = set()            # id(sentencia) con error semantico fatal: no se genera
 
     def nueva_etiqueta(self, prefijo='L'):
         self._contador_etiquetas += 1
         return f'.{prefijo}{self._contador_etiquetas}'
 
-    def generar(self, ast):
-        """Punto de entrada. Devuelve (codigo_asm: str | None, errores: list)"""
+    def generar(self, ast, omitir=None):
+        """Punto de entrada. Devuelve (codigo_asm: str | None, errores: list)
+        omitir: ids de sentencias que el analisis semantico marcó con error fatal (no se emiten)"""
+        self._omitir = set(omitir or ())
         self.texto = []
         self.datos = []
         self.errores = []
@@ -77,6 +83,9 @@ class GeneradorCodigo:
         self._tipos_parametros = {
             f[1]: [p[1] if isinstance(p[1], str) else None for p in f[2]] for f in funciones
         }
+        self._formas_parametros = {f[1]: [self._forma_de_tipo(p[1]) for p in f[2]] for f in funciones}
+        self._forma_retorno = {f[1]: self._forma_de_tipo(f[3]) for f in funciones}
+        self._elemento_retorno = {f[1]: self._elemento_de_tipo(f[3]) for f in funciones}
 
         if 'main' not in nombres_funciones:
             self.errores.append({
@@ -876,13 +885,28 @@ class GeneradorCodigo:
             'bucles': [],
             'etiqueta_fin_funcion': self.nueva_etiqueta('fin_funcion'),
             'tipo_retorno': self._tipos_funcion.get(nombre),
+            'forma_retorno': self._forma_retorno.get(nombre),
         }
 
         # Los primeros 8 parametros llegan en x0-x7 y se copian a su slot en el stack antes de generar el cuerpo 
         # para que el resto del codigo lo trate igual que cualquier otra variable
+        # Un arreglo llega como puntero a su elemento 0 y se copia completo al frame
+        self.texto.append('    # copia de parametros (x0-x7) a su espacio en el stack frame')
         indice_registro = 0
         for parametro in parametros:
             offset = self._offsets_por_nodo[id(parametro)]
+            forma = self._formas_por_nodo.get(id(parametro))
+            if forma is not None:
+                tipo = self._elemento_de_tipo(parametro[1])
+                contexto['scopes'][0][parametro[0]] = {'offset': offset, 'forma': forma, 'tipo': tipo}
+                if indice_registro < len(self.REGISTROS_PARAMETRO):
+                    self.texto.append(f'    mov x10, {self.REGISTROS_PARAMETRO[indice_registro]}')
+                    self._direccion_en_registro('x11', offset)
+                    self._emitir_copia_arreglo(self._total_elementos(forma))
+                else:
+                    self.texto.append(f'    # parametro "{parametro[0]}": no cabe en los registros x0-x7')
+                indice_registro += 1
+                continue
             tipo = parametro[1] if isinstance(parametro[1], str) else None
             contexto['scopes'][0][parametro[0]] = {'offset': offset, 'forma': None, 'tipo': tipo}
             necesarios = 2 if tipo == 'String' else 1
@@ -945,48 +969,107 @@ class GeneradorCodigo:
         strides.reverse()
         return strides
 
+    def _forma_de_tipo(self, tipo):
+        # ('array', ('array', 'i32', 3), 2)  ->  [2, 3]  (None si el tipo no es un arreglo)
+        forma = []
+        while isinstance(tipo, tuple) and tipo and tipo[0] == 'array':
+            forma.append(tipo[2])
+            tipo = tipo[1]
+        return forma or None
+
+    def _elemento_de_tipo(self, tipo):
+        # Tipo escalar de los elementos: ('array', ('array', 'i32', 3), 2) -> 'i32'
+        while isinstance(tipo, tuple) and tipo and tipo[0] == 'array':
+            tipo = tipo[1]
+        return tipo if isinstance(tipo, str) else None
+
+    def _total_elementos(self, forma):
+        total = 1
+        for dim in forma:
+            total *= dim
+        return total
+
+    def _reservar_arreglo(self, nodo, forma, offset):
+        bytes_necesarios = self._total_elementos(forma) * 8
+        # AArch64 exige que lo reservado con sub sp sea multiplo de 16 las variables escalares ya lo cumple (slots de 16)
+        # Se redondea hacia arriba ya que un arreglo con cantidad impar de elementos (N*8 con N impar) no cumple
+        bytes_reservados = ((bytes_necesarios + 15) // 16) * 16
+        offset_elem0 = offset[0] + 8
+        offset[0] += bytes_reservados
+        self._offsets_por_nodo[id(nodo)] = offset_elem0
+        self._formas_por_nodo[id(nodo)] = forma
+
     def _reservar_variables(self, cuerpo, parametros=()):
         # Cada parametro y cada 'let' del cuerpo recibe su propio slot, identificado por el nodo
         # Asi dos variables con el mismo nombre en bloques distintos nunca comparten memoria
         offset = [0]
+        formas_nombres = {}  # nombre -> forma, para saber el tamaño de arreglos que vienen de otra variable o de un slice
         for parametro in parametros:
-            offset[0] += TAMANO_SLOT
-            self._offsets_por_nodo[id(parametro)] = offset[0]
-        self._recolectar_lets(cuerpo, offset)
+            forma = self._forma_de_tipo(parametro[1])
+            if forma is not None:
+                self._reservar_arreglo(parametro, forma, offset)
+                formas_nombres[parametro[0]] = forma
+            else:
+                offset[0] += TAMANO_SLOT
+                self._offsets_por_nodo[id(parametro)] = offset[0]
+        self._recolectar_lets(cuerpo, offset, formas_nombres)
         return offset[0]
 
-    def _recolectar_lets(self, sentencias, offset):
+    def _forma_de_let(self, sentencia, formas_nombres):
+        # Forma del arreglo que declara un let: por su valor literal, por la anotacion de tipo,
+        # por la variable/llamada/slice de donde se copia. None si es una variable escalar
+        valor = sentencia[3]
+        forma = self._forma_arreglo(valor)
+        if forma is not None:
+            return forma
+        forma = self._forma_de_tipo(sentencia[2])
+        if forma is not None:
+            return forma
+        if valor is None:
+            return None
+        if valor[0] == 'var':
+            return formas_nombres.get(valor[1])
+        if valor[0] == 'llamada':
+            return self._forma_retorno.get(valor[1])
+        if valor[0] == 'array_slice':
+            base = valor[1]
+            forma_base = formas_nombres.get(base[1]) if base[0] == 'var' else None
+            inicio, fin = valor[2], valor[3]
+            if forma_base and inicio[0] == 'literal' and fin[0] == 'literal':
+                return [max(fin[1] - inicio[1], 0)] + forma_base[1:]
+        return None
+
+    def _recolectar_lets(self, sentencias, offset, formas_nombres=None):
+        if formas_nombres is None:
+            formas_nombres = {}
         for sentencia in sentencias:
+            if not isinstance(sentencia, tuple) or not sentencia:
+                continue
             tipo = sentencia[0]
             if tipo == 'let':
-                forma = self._forma_arreglo(sentencia[3])
-                if forma is not None:
-                    total = 1
-                    for dim in forma:
-                        total *= dim
-                    bytes_necesarios = total * 8
-                    # AArch64 exige que lo reservado con sub sp sea multiplo de 16 las variables escalares ya lo cumplen (slots de 16)
-                    # Se redondea hacia arriba ya que un arreglo con cantidad impar de elementos (N*8 con N impar) no cumple
-                    bytes_reservados = ((bytes_necesarios + 15) // 16) * 16
-                    offset_elem0 = offset[0] + 8
-                    offset[0] += bytes_reservados
-                    self._offsets_por_nodo[id(sentencia)] = offset_elem0
-                    self._formas_por_nodo[id(sentencia)] = forma
+                forma = self._forma_de_let(sentencia, formas_nombres)
+                if forma is not None and self._total_elementos(forma) > 0:
+                    self._reservar_arreglo(sentencia, forma, offset)
+                    formas_nombres[sentencia[1]] = forma
                 else:
                     offset[0] += TAMANO_SLOT
                     self._offsets_por_nodo[id(sentencia)] = offset[0]
+                    formas_nombres.pop(sentencia[1], None)
             elif tipo == 'if':
-                self._recolectar_lets(sentencia[2], offset)
+                self._recolectar_lets(sentencia[2], offset, formas_nombres)
                 cuerpo_else = sentencia[3]
                 if cuerpo_else is not None:
                     if cuerpo_else[0] == 'if':
-                        self._recolectar_lets([cuerpo_else], offset)
+                        self._recolectar_lets([cuerpo_else], offset, formas_nombres)
                     else:
-                        self._recolectar_lets(cuerpo_else, offset)
-            elif tipo == 'while':
-                self._recolectar_lets(sentencia[2], offset)
-            elif tipo == 'loop':
-                self._recolectar_lets(sentencia[2], offset)
+                        self._recolectar_lets(cuerpo_else, offset, formas_nombres)
+            elif tipo in ('while', 'loop'):
+                self._recolectar_lets(sentencia[2], offset, formas_nombres)
+            elif tipo == 'bloque':
+                self._recolectar_lets(sentencia[1], offset, formas_nombres)
+            elif tipo == 'match':
+                for caso in sentencia[2]:
+                    self._recolectar_lets(caso[2], offset, formas_nombres)
 
     # --- ACCESO A VARIABLES Y STACK ---
     # ldr/str con offset negativo respecto a x29 solo admite hasta -256, para variables mas lejanas se calcula la direccion en x16
@@ -1015,6 +1098,72 @@ class GeneradorCodigo:
         else:
             self.texto.append(f'    mov x16, #{bytes_}')
             self.texto.append(f'    {operacion} sp, sp, x16')
+
+    def _direccion_en_registro(self, registro, offset):
+        # registro = x29 - offset (direccion real de una variable o del elemento 0 de un arreglo)
+        if offset <= 4095:
+            self.texto.append(f'    sub {registro}, x29, #{offset}')
+        else:
+            self._cargar_inmediato(registro, offset)
+            self.texto.append(f'    sub {registro}, x29, {registro}')
+
+    def _emitir_copia_arreglo(self, total):
+        # Copia 'total' elementos de 8 bytes de x10 (origen) a x11 (destino)
+        # Convencion de los arreglos: el elemento i esta en (direccion del elemento 0) - 8*i, por eso se avanza hacia abajo
+        # Usa x9 y x12; no toca x0-x7
+        if total <= 0:
+            return
+        etiqueta = self.nueva_etiqueta('copia_arreglo')
+        self.texto.append(f'    # copiar arreglo de {total} elementos')
+        self._cargar_inmediato('x12', total)
+        self.texto.append(f'{etiqueta}:')
+        self.texto.append('    ldr x9, [x10], #-8')
+        self.texto.append('    str x9, [x11], #-8')
+        self.texto.append('    subs x12, x12, #1')
+        self.texto.append(f'    b.ne {etiqueta}')
+
+    def _generar_puntero_arreglo(self, nodo, contexto):
+        # Deja en x0 la direccion del elemento 0 de un arreglo y devuelve su forma (None si no se pudo)
+        if nodo[0] == 'var':
+            info = self._buscar_variable(nodo[1], contexto)
+            if info['forma'] is None:
+                return None
+            self._direccion_en_registro('x0', info['offset'])
+            return info['forma']
+        if nodo[0] == 'llamada' and self._forma_retorno.get(nodo[1]) is not None:
+            self._generar_expresion(nodo, contexto)
+            return self._forma_retorno[nodo[1]]
+        if nodo[0] in ('array_literal', 'array_repeat'):
+            # Arreglo literal usado como valor: se arma en el heap
+            forma = self._forma_arreglo(nodo)
+            planos = self._aplanar_valores(nodo)
+            total = len(planos)
+            tipo_elemento = self._tipo_expresion(planos[0], contexto) if planos else 'i32'
+            self._cargar_inmediato('x0', total * 8)
+            self.texto.append('    bl reservar_heap')
+            self._usa_heap = True
+            self._cargar_inmediato('x1', (total - 1) * 8)
+            self.texto.append('    add x0, x0, x1')
+            self.texto.append('    str x0, [sp, -16]!')         # direccion del elemento 0 (protegida)
+            for i, elemento in enumerate(planos):
+                self._generar_expresion(elemento, contexto)
+                self._convertir_a_tipo(self._tipo_expresion(elemento, contexto), tipo_elemento)
+                self.texto.append('    ldr x1, [sp]')
+                if i:
+                    self._cargar_inmediato('x2', i * 8)
+                    self.texto.append('    sub x1, x1, x2')
+                self.texto.append('    str x0, [x1]')
+            self.texto.append('    ldr x0, [sp], 16')
+            return forma
+        if nodo[0] == 'array_slice' and nodo[1][0] == 'var':
+            info = self._buscar_variable(nodo[1][1], contexto)
+            inicio, fin = nodo[2], nodo[3]
+            if info['forma'] is None or inicio[0] != 'literal' or fin[0] != 'literal':
+                return None
+            bloque = self._total_elementos(info['forma'][1:]) if len(info['forma']) > 1 else 1
+            self._direccion_en_registro('x0', info['offset'] + inicio[1] * bloque * 8)
+            return [max(fin[1] - inicio[1], 0)] + info['forma'][1:]
+        return None
 
     # --- SCOPES ---
 
@@ -1086,6 +1235,41 @@ class GeneradorCodigo:
     # --- SENTENCIAS ---
 
     def _generar_sentencia(self, sentencia, contexto):
+        if not isinstance(sentencia, tuple) or not sentencia:
+            return
+        if id(sentencia) in self._omitir:
+            self._generar_sentencia_omitida(sentencia, contexto)
+            return
+        # Red de seguridad: si una sentencia no se puede traducir, se descarta solo esa y el resto del programa sigue
+        inicio_texto = len(self.texto)
+        cantidad_scopes = len(contexto['scopes'])
+        cantidad_bucles = len(contexto['bucles'])
+        try:
+            self._generar_sentencia_interna(sentencia, contexto)
+        except Exception as error:
+            del self.texto[inicio_texto:]
+            del contexto['scopes'][cantidad_scopes:]
+            del contexto['bucles'][cantidad_bucles:]
+            self.texto.append(f'    # sentencia "{sentencia[0]}" no generada: {error}')
+            if sentencia[0] == 'let':
+                self._generar_sentencia_omitida(sentencia, contexto)
+
+    def _generar_sentencia_omitida(self, sentencia, contexto):
+        # Sentencia con error semantico: no se ejecuta, pero si declaraba una variable
+        # se declara con su valor por defecto para que el resto del programa la pueda usar
+        self.texto.append(f'    # sentencia "{sentencia[0]}" omitida por error semantico')
+        if sentencia[0] != 'let' or id(sentencia) not in self._offsets_por_nodo:
+            return
+        tipo = sentencia[2] if isinstance(sentencia[2], str) else None
+        forma = self._formas_por_nodo.get(id(sentencia))
+        if forma is not None:
+            tipo = self._elemento_de_tipo(sentencia[2]) or 'i32'
+        offset = self._declarar_variable(sentencia, contexto, tipo=tipo or 'None')
+        total = self._total_elementos(forma) if forma is not None else 1
+        for i in range(total):
+            self._guardar_variable('xzr', offset + i * 8)
+
+    def _generar_sentencia_interna(self, sentencia, contexto):
         tipo = sentencia[0]
 
         if tipo == 'let':
@@ -1110,6 +1294,14 @@ class GeneradorCodigo:
             self._generar_match(sentencia, contexto)
         elif tipo == 'return':
             self._generar_return(sentencia, contexto)
+        elif tipo == 'bloque':
+            self._abrir_scope(contexto)
+            for sent in sentencia[1]:
+                self._generar_sentencia(sent, contexto)
+            self._cerrar_scope(contexto)
+        elif tipo in ('binop', 'unop', 'var', 'literal', 'bool', 'char', 'string', 'string_from', 'array_access'):
+            # Sentencia de tipo expresion: se evalua y se descarta el valor
+            self._generar_expresion(sentencia, contexto)
         else:
             self.texto.append(f'    # sentencia "{tipo}"')
 
@@ -1155,9 +1347,17 @@ class GeneradorCodigo:
             cuerpo = caso[2]
             etiqueta_siguiente = self.nueva_etiqueta('match_caso')
 
-            if patron != 'default':
+            if patron != 'default' and not (isinstance(patron, tuple) and patron[0] == 'var'):
+                # ('var', x) como patron se comporta como comodin (en Rust liga el valor a x)
+                if isinstance(patron, tuple) and patron[0] == 'char':
+                    valor_patron = self._punto_de_codigo(patron[1])
+                elif isinstance(patron, tuple) and patron[0] == 'bool':
+                    valor_patron = 1 if patron[1] else 0
+                else:
+                    valor_patron = patron
                 self.texto.append('    ldr x0, [sp]')
-                self.texto.append(f'    cmp x0, #{patron}')
+                self._cargar_inmediato('x1', valor_patron)
+                self.texto.append('    cmp x0, x1')
                 self.texto.append(f'    bne {etiqueta_siguiente}')
 
             self.texto.append('    add sp, sp, #16')
@@ -1244,7 +1444,21 @@ class GeneradorCodigo:
     def _generar_return(self, nodo, contexto):
         # nodo = ('return', valor | None)
         valor = nodo[1]
-        if valor is not None:
+        if valor is not None and contexto.get('forma_retorno') is not None:
+            # Retornar un arreglo: se copia al heap (el frame de la funcion se libera al salir) y se devuelve en x0 la direccion de su elemento 0
+            forma = self._generar_puntero_arreglo(valor, contexto)
+            if forma is None:
+                raise ValueError('el valor retornado no es un arreglo conocido')
+            total = self._total_elementos(forma)
+            self.texto.append('    mov x10, x0')
+            self._cargar_inmediato('x0', total * 8)
+            self.texto.append('    bl reservar_heap')
+            self._usa_heap = True
+            self._cargar_inmediato('x1', (total - 1) * 8)
+            self.texto.append('    add x0, x0, x1')         # x0 = elemento 0 (los demas van hacia abajo)
+            self.texto.append('    mov x11, x0')
+            self._emitir_copia_arreglo(total)
+        elif valor is not None:
             self._generar_expresion(valor, contexto)
             self._convertir_a_tipo(self._tipo_expresion(valor, contexto), contexto.get('tipo_retorno'))
         self.texto.append(f'    b {contexto["etiqueta_fin_funcion"]}')
@@ -1260,6 +1474,24 @@ class GeneradorCodigo:
             tipo_elemento = self._tipo_elemento_arreglo(tipo_declarado, valor, contexto)
             offset_elem0 = self._declarar_variable(nodo, contexto, tipo=tipo_elemento)
             self._generar_inicializacion_arreglo(valor, offset_elem0, contexto, tipo_elemento)
+            return
+
+        forma_destino = self._formas_por_nodo.get(id(nodo))
+        if forma_destino is not None:
+            # Arreglo que se copia desde otra variable, desde el retorno de una funcion o desde un slice
+            tipo_elemento = self._elemento_de_tipo(tipo_declarado) or self._tipo_elemento_origen(valor, contexto)
+            if valor is None:
+                offset_elem0 = self._declarar_variable(nodo, contexto, tipo=tipo_elemento or 'i32')
+                for i in range(self._total_elementos(forma_destino)):
+                    self._guardar_variable('xzr', offset_elem0 + i * 8)
+                return
+            forma_origen = self._generar_puntero_arreglo(valor, contexto)
+            if forma_origen is None:
+                raise ValueError('no se pudo obtener el arreglo de origen')
+            offset_elem0 = self._declarar_variable(nodo, contexto, tipo=tipo_elemento)
+            self.texto.append('    mov x10, x0')
+            self._direccion_en_registro('x11', offset_elem0)
+            self._emitir_copia_arreglo(min(self._total_elementos(forma_origen), self._total_elementos(forma_destino)))
             return
 
         # El tipo se calcula antes de declarar el nombre (let x = x + 1 usa el x anterior)
@@ -1283,6 +1515,18 @@ class GeneradorCodigo:
         offset = self._declarar_variable(nodo, contexto, tipo=tipo)
         self._guardar_segun_tipo(tipo, offset)
 
+    def _tipo_elemento_origen(self, valor, contexto):
+        # Tipo de los elementos de un arreglo que viene de una variable, una llamada o un slice
+        if valor is None:
+            return None
+        if valor[0] == 'var':
+            return self._buscar_variable(valor[1], contexto)['tipo']
+        if valor[0] == 'llamada':
+            return self._elemento_retorno.get(valor[1])
+        if valor[0] == 'array_slice':
+            return self._tipo_elemento_origen(valor[1], contexto)
+        return None
+
     def _tipo_elemento_arreglo(self, tipo_declarado, valor, contexto):
         # Tipo escalar de los elementos: sale de la anotacion [[T; n]; m] o del primer elemento del literal
         actual = tipo_declarado
@@ -1305,8 +1549,18 @@ class GeneradorCodigo:
         nombre = nodo[1]
         valor = nodo[2]
 
-        self._generar_expresion(valor, contexto)
         info = self._buscar_variable(nombre, contexto)
+        if info['forma'] is not None:
+            # arreglo = otro_arreglo / arreglo = funcion_que_retorna_arreglo()
+            forma_origen = self._generar_puntero_arreglo(valor, contexto)
+            if forma_origen is None:
+                raise ValueError('asignacion de arreglo no soportada')
+            self.texto.append('    mov x10, x0')
+            self._direccion_en_registro('x11', info['offset'])
+            self._emitir_copia_arreglo(min(self._total_elementos(forma_origen), self._total_elementos(info['forma'])))
+            return
+
+        self._generar_expresion(valor, contexto)
         self._convertir_a_tipo(self._tipo_expresion(valor, contexto), info['tipo'])
         self._guardar_segun_tipo(info['tipo'], info['offset'])
 
@@ -1384,18 +1638,13 @@ class GeneradorCodigo:
             tipo_base = self._buscar_variable(nombre, contexto)['tipo']
             return 'String' if tipo_base == 'Vec' else tipo_base
         if tipo == 'unop':
-            return 'bool' if nodo[1] == '!' else self._tipo_expresion(nodo[2], contexto)
+            operando = self._tipo_expresion(nodo[2], contexto)
+            if nodo[1] == '!':
+                return 'bool' if operando in ('bool', None) else 'None'
+            return operando if operando in ('i32', 'f64', None) else 'None'
         if tipo == 'binop':
-            op = nodo[1]
-            if op in ('==', '!=', '>', '>=', '<', '<=', '&&', '||'):
-                return 'bool'
-            izquierdo = self._tipo_expresion(nodo[2], contexto)
-            derecho = self._tipo_expresion(nodo[3], contexto)
-            if 'f64' in (izquierdo, derecho):
-                return 'f64'
-            if 'String' in (izquierdo, derecho):
-                return 'String'
-            return 'i32'
+            return self._tipo_binop(nodo[1], self._tipo_expresion(nodo[2], contexto),
+                                    self._tipo_expresion(nodo[3], contexto))
         if tipo == 'llamada':
             nombre = nodo[1]
             if nombre in ('len', 'random'):
@@ -1411,8 +1660,41 @@ class GeneradorCodigo:
             return self._tipos_funcion.get(nombre)
         return None
 
+    def _tipo_binop(self, op, izquierdo, derecho):
+        # Tablas de tipos: 'None' = combinacion invalida (seimprime como None)
+        numericos = ('i32', 'f64')
+        if 'None' in (izquierdo, derecho):
+            return 'None'
+        if op in ('&&', '||'):
+            return 'bool' if izquierdo in ('bool', None) and derecho in ('bool', None) else 'None'
+        if op in ('==', '!=', '>', '>=', '<', '<='):
+            if None in (izquierdo, derecho):
+                return 'bool'
+            validos = ((izquierdo in numericos and derecho in numericos)
+                       or (izquierdo, derecho) in (('i32', 'char'), ('char', 'i32'), ('char', 'char'),
+                                                    ('bool', 'bool'), ('String', 'String')))
+            return 'bool' if validos else 'None'
+        if izquierdo in numericos and derecho in numericos:
+            return 'f64' if 'f64' in (izquierdo, derecho) else 'i32'
+        if op == '+' and izquierdo == 'String' and derecho == 'String':
+            return 'String'
+        if op == '*' and (izquierdo, derecho) in (('i32', 'String'), ('String', 'i32')):
+            return 'String'
+        if None in (izquierdo, derecho):
+            # tipo desconocido: se asume entero
+            otro = derecho if izquierdo is None else izquierdo
+            return otro if otro in numericos else 'i32'
+        return 'None'
+
     def _generar_expresion(self, nodo, contexto):
         tipo = nodo[0]
+
+        if tipo in ('binop', 'unop') and self._tipo_expresion(nodo, contexto) == 'None':
+            # Operacion con tipos incompatibles (ya reportada por el semantico): el valor es None
+            self.texto.append(f'    # operacion "{nodo[1]}" con tipos incompatibles -> None')
+            self.texto.append('    mov x0, #0')
+            self.texto.append('    mov x1, #0')
+            return
 
         if tipo == 'literal':
             if isinstance(nodo[1], float):
@@ -1849,8 +2131,26 @@ class GeneradorCodigo:
                 self._generar_imprimir_arreglo(info)
                 return
 
+        if (nodo[0] == 'llamada' and self._forma_retorno.get(nodo[1]) is not None) or \
+                nodo[0] in ('array_slice', 'array_literal', 'array_repeat'):
+            # Arreglo que no esta en una variable: se imprime desde su direccion
+            tipo_elemento = (self._elemento_retorno.get(nodo[1]) if nodo[0] == 'llamada'
+                             else self._tipo_elemento_origen(nodo, contexto))
+            if nodo[0] in ('array_literal', 'array_repeat'):
+                planos = self._aplanar_valores(nodo)
+                tipo_elemento = self._tipo_expresion(planos[0], contexto) if planos else 'i32'
+            forma = self._generar_puntero_arreglo(nodo, contexto)
+            if forma is None:
+                raise ValueError('arreglo no soportado en println!')
+            self.texto.append('    str x0, [sp, -16]!')
+            self._generar_imprimir_arreglo_desde_puntero(forma, tipo_elemento or 'i32')
+            self.texto.append('    add sp, sp, #16')
+            return
+
         tipo = self._tipo_expresion(nodo, contexto)
-        if tipo == 'Vec':
+        if tipo == 'None':
+            self._generar_escribir_texto_literal('None')
+        elif tipo == 'Vec':
             self._generar_expresion(nodo, contexto)     # x0 = bloque de split
             self.texto.append('    bl imprimir_vec_strings')
             self._usa_imprimir_vec = True
@@ -1908,6 +2208,37 @@ class GeneradorCodigo:
 
         recorrer(0, 0)
 
+    def _generar_imprimir_arreglo_desde_puntero(self, forma, elemento):
+        # Igual que _generar_imprimir_arreglo pero la direccion del elemento 0 esta en [sp]
+        strides = self._strides(forma)
+
+        def cargar(posicion):
+            self.texto.append('    ldr x1, [sp]')
+            if posicion:
+                self._cargar_inmediato('x2', posicion * 8)
+                self.texto.append('    sub x1, x1, x2')
+            self.texto.append('    ldr x0, [x1]')
+
+        def recorrer(nivel, desplazamiento):
+            self._generar_escribir_texto_literal('[')
+            for i in range(forma[nivel]):
+                if i > 0:
+                    self._generar_escribir_texto_literal(', ')
+                posicion = desplazamiento + i * strides[nivel]
+                if nivel < len(forma) - 1:
+                    recorrer(nivel + 1, posicion)
+                elif elemento == 'char':
+                    self._generar_escribir_texto_literal('"')
+                    cargar(posicion)
+                    self._generar_imprimir_escalar_x0('char')
+                    self._generar_escribir_texto_literal('"')
+                else:
+                    cargar(posicion)
+                    self._generar_imprimir_escalar_x0(elemento)
+            self._generar_escribir_texto_literal(']')
+
+        recorrer(0, 0)
+
     def _emitir_literal_string(self, texto):
         etiqueta = self.nueva_etiqueta('str')[1:]   # sin el punto: va al .data, no es una etiqueta local
         datos = texto.encode('utf-8')
@@ -1940,9 +2271,20 @@ class GeneradorCodigo:
     def _generar_llamada_usuario(self, nombre, argumentos, contexto):
         # Cada argumento se evalua y se guarda en el stack de inmediato (un String ocupa dos entradas: puntero y largo) 
         # y al final se sacan en orden inverso para dejarlos en x0, x1, x2...
+        if nombre not in self._tipos_funcion:
+            raise ValueError(f"la funcion '{nombre}' no existe")
         total = 0
         tipos_parametros = self._tipos_parametros.get(nombre, [])
+        formas_parametros = self._formas_parametros.get(nombre, [])
         for posicion, argumento in enumerate(argumentos):
+            es_arreglo = posicion < len(formas_parametros) and formas_parametros[posicion] is not None
+            if es_arreglo:
+                # Los arreglos viajan como la direccion de su elemento 0; la funcion llamada hace su propia copia
+                if self._generar_puntero_arreglo(argumento, contexto) is None:
+                    raise ValueError('argumento de tipo arreglo no soportado')
+                self.texto.append('    str x0, [sp, -16]!')
+                total += 1
+                continue
             self._generar_expresion(argumento, contexto)
             if posicion < len(tipos_parametros):
                 self._convertir_a_tipo(self._tipo_expresion(argumento, contexto), tipos_parametros[posicion])

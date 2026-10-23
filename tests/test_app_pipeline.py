@@ -49,5 +49,10 @@ respuesta2 = cliente.post('/execute', json={'codigo': codigo_con_error})
 datos2 = respuesta2.get_json()
 print('HTTP status:', respuesta2.status_code)
 print('Errores:', [e.get('formato') for e in datos2.get('errores', [])])
-print('Salida (deberia estar vacia):', datos2.get('salida'))
-print('codigo_arm64 (deberia ser vacio):', repr(datos2.get('codigo_arm64')))
+# Resiliencia: el error se reporta, la sentencia con error se omite y el resto del programa se ejecuta igual (x queda con su valor por defecto 0)
+print('Salida (deberia ser [\'0\']):', datos2.get('salida'))
+if datos2.get('salida') == ['0'] and len(datos2.get('errores', [])) == 1:
+    print('OK: se reporto el error y el programa siguio ejecutando')
+else:
+    print('FALLO: se esperaba 1 error y la salida [\'0\']')
+    raise SystemExit(1)

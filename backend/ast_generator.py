@@ -29,4 +29,11 @@ def generar_ast(nodos):
                 dot.edge(f'n{j}', node_id)
                 break
     
-    return base64.b64encode(dot.pipe()).decode('utf-8')
+    try:
+        imagen = dot.pipe()
+    except Exception:
+        # splines='ortho' hace fallar a dot en algunos arboles
+        # Se vuelve a intentar con lineas normales para no quedarse sin reporte
+        dot.attr(splines='line')
+        imagen = dot.pipe()
+    return base64.b64encode(imagen).decode('utf-8')
