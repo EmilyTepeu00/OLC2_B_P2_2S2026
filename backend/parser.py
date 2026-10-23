@@ -1,6 +1,7 @@
 # --- ANALIZADOR SINTACTICO ---
 
 import ply.yacc as yacc
+from ply.lex import LexToken
 from backend.lexer import tokens, lexer, escanear_errores_lexicos, encontrar_columna
 
 errores_parseo = []
@@ -9,6 +10,86 @@ columnas_nodo = {}
 _codigo_actual = ''  # para calcular columnas dentro de las reglas de gramatica
 
 inicio = 'programa'
+
+
+class FlujoTokens:
+    # Envuelve al lexer para poder:
+    #  - devolverle al parser tokens "inventados" (un ';' o '}' que faltaba) durante la recuperacion de errores
+    #  - recordar donde termino el ultimo token real (para reportar la columna del error)
+    #  - llevar la cuenta de llaves abiertas (para cerrar las que falten al llegar al fin del archivo)
+    def __init__(self, lexer_base):
+        self.lexer = lexer_base
+        self.pendientes = []
+        self.reset()
+
+    def reset(self):
+        self.pendientes = []
+        self.profundidad = 0       # llaves '{' abiertas sin cerrar
+        self.fin_previo = None     # lexpos donde termino el penultimo token real
+        self.fin_actual = None     # lexpos donde termino el ultimo token real
+        self.ultimo = None         # ultimo token entregado al parser (real o inventado)
+        self.inserciones = 0
+
+    def input(self, data):
+        self.lexer.input(data)
+
+    # PLY lee estos atributos del lexer cuando usa tracking=True
+    @property
+    def lineno(self):
+        return self.lexer.lineno
+
+    @property
+    def lexpos(self):
+        return self.lexer.lexpos
+
+    @property
+    def lexdata(self):
+        return self.lexer.lexdata
+
+    def token(self):
+        if self.pendientes:
+            tok = self.pendientes.pop(0)
+        else:
+            tok = self.lexer.token()
+            if tok is not None:
+                self.fin_previo = self.fin_actual
+                self.fin_actual = self.lexer.lexpos
+                if tok.type == 'LLAVEIZQ':
+                    self.profundidad += 1
+                elif tok.type == 'LLAVEDER':
+                    self.profundidad -= 1
+        self.ultimo = tok
+        return tok
+
+
+flujo = FlujoTokens(lexer)
+
+
+def _token_inventado(tipo, valor, lexpos):
+    tok = LexToken()
+    tok.type = tipo
+    tok.value = valor
+    tok.lexpos = lexpos if lexpos is not None else 0
+    tok.lineno = _linea_de_pos(tok.lexpos)
+    tok.lexer = flujo.lexer
+    return tok
+
+
+def _linea_de_pos(pos):
+    return _codigo_actual.count('\n', 0, pos) + 1
+
+
+def _registrar(p, nodo, i=1):
+    # Guarda la linea y columna del simbolo i de la regla para el nodo (se usan en los mensajes de error)
+    try:
+        linea = p.lineno(i)
+        lexpos = p.lexpos(i)
+    except Exception:
+        return
+    if linea:
+        lineas_nodo[id(nodo)] = linea
+    if lexpos is not None and _codigo_actual:
+        columnas_nodo[id(nodo)] = encontrar_columna(_codigo_actual, lexpos)
 
 precedence = (
     ('left', 'O'),                                              # ||
@@ -99,15 +180,8 @@ def p_sentencia(p):
                  | sentencia_bloque
                  | expresion PUNTOCOMA"""
     p[0] = p[1]
-    linea = p.lineno(1)
-    if linea and isinstance(p[0], tuple):
-        lineas_nodo[id(p[0])] = linea
-        try:
-            lexpos = p.lexpos(1)
-            if lexpos is not None and _codigo_actual:
-                columnas_nodo[id(p[0])] = encontrar_columna(_codigo_actual, lexpos)
-        except Exception:
-            pass
+    if isinstance(p[0], tuple) and id(p[0]) not in lineas_nodo:
+        _registrar(p, p[0], 1)
 
 def p_sentencia_bloque(p):
     "sentencia_bloque : LLAVEIZQ lista_sentencias LLAVEDER"
@@ -233,18 +307,41 @@ def p_casos_match(p):
         p[0] = p[1] + [p[2]]
 
 def p_caso_match(p):
-    """caso_match : INTEGER FLECHA_GORDA expresion COMA
-                  | ID FLECHA_GORDA expresion COMA
-                  | INTEGER FLECHA_GORDA LLAVEIZQ lista_sentencias LLAVEDER COMA
-                  | ID FLECHA_GORDA LLAVEIZQ lista_sentencias LLAVEDER COMA"""
-    # Se soporta las dos formas: "patron => expresion"
+    """caso_match : patron_match FLECHA_GORDA expresion COMA
+                  | patron_match FLECHA_GORDA expresion
+                  | patron_match FLECHA_GORDA LLAVEIZQ lista_sentencias LLAVEDER COMA
+                  | patron_match FLECHA_GORDA LLAVEIZQ lista_sentencias LLAVEDER"""
+    # Se soportan las dos formas: "patron => expresion," y "patron => { sentencias }"
+    # La coma es opcional en el ultimo caso y despues de un bloque (igual que en Rust)
     patron = p[1]
-    cuerpo = [p[3]] if len(p) == 5 else p[4]
-    # "_" se tokeniza como ID normal (empieza con "_"), se compara el valor
-    if patron == '_':
-        p[0] = ('caso', 'default', cuerpo)
+    if p.slice[3].type == 'LLAVEIZQ':
+        cuerpo = p[4]
     else:
-        p[0] = ('caso', patron, cuerpo)
+        cuerpo = [p[3]]
+    p[0] = ('caso', patron, cuerpo)
+
+def p_patron_match(p):
+    """patron_match : INTEGER
+                    | RESTA INTEGER
+                    | CHAR_LITERAL
+                    | TRUE
+                    | FALSE
+                    | ID"""
+    # El patron queda como: 'default' (comodin "_"), un entero, ('char', c) o ('bool', v)
+    tipo_token = p.slice[1].type
+    if tipo_token == 'INTEGER':
+        p[0] = p[1]
+    elif tipo_token == 'RESTA':
+        p[0] = -p[2]
+    elif tipo_token == 'CHAR_LITERAL':
+        p[0] = ('char', p[1])
+    elif tipo_token in ('TRUE', 'FALSE'):
+        p[0] = ('bool', p[1])
+    elif p[1] == '_':
+        # "_" se tokeniza como ID normal (empieza con "_")
+        p[0] = 'default'
+    else:
+        p[0] = ('var', p[1])
 
 def p_sentencia_return(p):
     """sentencia_return : RETURN valor PUNTOCOMA
@@ -285,11 +382,13 @@ def p_expresion_binaria(p):
                  | expresion Y expresion
                  | expresion O expresion"""
     p[0] = ('binop', p[2], p[1], p[3])
+    _registrar(p, p[0], 2)  # la columna del error es la del operador
 
 def p_expresion_unaria(p):
     """expresion : NO expresion
                  | RESTA expresion %prec UMINUS"""
     p[0] = ('unop', p[1], p[2])
+    _registrar(p, p[0], 1)
 
 def p_expresion_literal(p):
     """expresion : INTEGER
@@ -307,6 +406,7 @@ def p_expresion_literal(p):
         p[0] = ('char', p[1])
     else:
         p[0] = ('literal', p[1])
+    _registrar(p, p[0], 1)
 
 def p_valor(p):
     """valor : expresion
@@ -319,6 +419,7 @@ def p_valor(p):
 def p_expresion_variable(p):
     "expresion : ID"
     p[0] = ('var', p[1])
+    _registrar(p, p[0], 1)
 
 def p_expresion_llamada(p):
     """expresion : ID PARENIZQ lista_argumentos PARENDER
@@ -327,11 +428,13 @@ def p_expresion_llamada(p):
         p[0] = ('llamada', 'println', p[4])
     else:
         p[0] = ('llamada', p[1], p[3])
+    _registrar(p, p[0], 1)
 
 def p_expresion_llamada_metodo(p):
     """expresion : expresion PUNTO ID PARENIZQ lista_argumentos PARENDER"""
     # variable.metodo(args) se traduce a llamada(metodo, [variable] + args)
     p[0] = ('llamada', p[3], [p[1]] + p[5])
+    _registrar(p, p[0], 1)
 
 def p_expresion_string_estatico(p):
     """expresion : STRING_TYPE DOSDOSPUNTOS ID PARENIZQ lista_argumentos PARENDER"""
@@ -340,6 +443,7 @@ def p_expresion_string_estatico(p):
         p[0] = ('string_from', p[5][0] if p[5] else ('string', ''))
     else:  # String::new()
         p[0] = ('string', '')
+    _registrar(p, p[0], 1)
 
 def p_lista_argumentos(p):
     """lista_argumentos : 
@@ -361,6 +465,7 @@ def p_expresion_agrupada(p):
 def p_expresion_array_literal(p):
     """expresion : CORCHIZQ lista_elementos CORCHDER"""
     p[0] = ('array_literal', p[2])
+    _registrar(p, p[0], 1)
 
 def p_expresion_array_repetido(p):
     """expresion : CORCHIZQ expresion PUNTOCOMA INTEGER CORCHDER"""
@@ -382,10 +487,12 @@ def p_lista_elementos(p):
 def p_expresion_array_access(p):
     """expresion : expresion CORCHIZQ expresion CORCHDER"""
     p[0] = ('array_access', p[1], p[3])
+    _registrar(p, p[0], 1)  # columna donde empieza el acceso: numeros[5] -> la de "numeros"
 
 def p_expresion_array_slice(p):
     """expresion : AMPERSAND expresion CORCHIZQ expresion RANGO expresion CORCHDER"""
     p[0] = ('array_slice', p[2], p[4], p[6])
+    _registrar(p, p[0], 1)
 
 # --- STRUCTS ---
 
@@ -434,32 +541,79 @@ def p_sentencia_error(p):
     # YACC descarta tokens hasta el siguiente ';' o '}' y sigue parseando el resto dela rchivo desde ahi en vez de dat errror
     p[0] = ('error_stmt',)
 
-def p_error(p):
-    if p:
-        # Se busca hacia atras el ultimo caracter antes de ese token y se reporta ahi
-        texto = p.lexer.lexdata
-        pos = p.lexpos - 1
-        while pos >= 0 and texto[pos] in ' \t\r\n':
-            pos -= 1
-        if pos >= 0:
-            linea = texto.count('\n', 0, pos) + 1
-            columna = encontrar_columna(texto, pos) + 1
-        else:
-            linea = p.lineno
-            columna = encontrar_columna(texto, p.lexpos)
-        errores_parseo.append({
-            'tipo': 'Sintactico',
-            'linea': linea,
-            'columna': columna,
-            'mensaje': f"Token inesperado: '{p.value}'.",
-        })
+MAX_INSERCIONES = 200  # tope de tokens inventados para que la recuperacion nunca se cicle
+
+
+def _agregar_error_sintactico(pos, mensaje):
+    # pos = lexpos justo despues del ultimo token valido; el error se reporta ahi (como en el enunciado)
+    if pos is None:
+        linea, columna = 0, 0
     else:
-        errores_parseo.append({
-            'tipo': 'Sintactico',
-            'linea': 0,
-            'columna': 0,
-            'mensaje': 'Fin de archivo inesperado.',
-        })
+        linea = _linea_de_pos(pos)
+        columna = encontrar_columna(_codigo_actual, pos)
+    errores_parseo.append({
+        'tipo': 'Sintactico',
+        'linea': linea,
+        'columna': columna,
+        'mensaje': mensaje,
+    })
+
+
+def _fin_token_previo(p):
+    # Posicion justo despues del ultimo token real antes del token del error
+    if flujo.fin_previo is not None and flujo.fin_previo <= p.lexpos:
+        return flujo.fin_previo
+    # Respaldo: buscar hacia atras saltando espacios
+    pos = p.lexpos - 1
+    while pos >= 0 and _codigo_actual[pos] in ' \t\r\n':
+        pos -= 1
+    return pos + 1 if pos >= 0 else p.lexpos
+
+
+def p_error(p):
+    acciones = parser.action.get(getattr(parser, 'state', None), {})
+
+    if p is None:
+        # Fin de archivo con llaves sin cerrar: se reporta una vez y se "cierran" todas para que el AST quede completo
+        if flujo.profundidad > 0 and 'LLAVEDER' in acciones and flujo.inserciones < MAX_INSERCIONES:
+            _agregar_error_sintactico(flujo.fin_actual, "Se esperaba '}'.")
+            cantidad = flujo.profundidad
+            flujo.profundidad = 0
+            flujo.inserciones += cantidad
+            tokens_cierre = [_token_inventado('LLAVEDER', '}', flujo.fin_actual) for _ in range(cantidad)]
+            flujo.pendientes = tokens_cierre[1:] + flujo.pendientes
+            parser.errok()
+            return tokens_cierre[0]
+        _agregar_error_sintactico(flujo.fin_actual, 'Fin de archivo inesperado.')
+        return None
+
+    fin_previo = _fin_token_previo(p)
+
+    # Falta de ';': el token del error empieza en una linea nueva y en este punto un ';' era valido
+    # Se inventa el ';' y se le devuelve el token original al parser para no perder la siguiente sentencia
+    ultimo_fue_puntocoma = flujo.ultimo is not None and flujo.ultimo is not p and flujo.ultimo.type == 'PUNTOCOMA'
+    if ('PUNTOCOMA' in acciones and p.type != 'PUNTOCOMA'
+            and _linea_de_pos(p.lexpos) > _linea_de_pos(max(fin_previo - 1, 0))
+            and not ultimo_fue_puntocoma
+            and flujo.inserciones < MAX_INSERCIONES):
+        _agregar_error_sintactico(fin_previo, "Se esperaba ';'.")
+        flujo.inserciones += 1
+        flujo.pendientes.insert(0, p)
+        parser.errok()
+        return _token_inventado('PUNTOCOMA', ';', fin_previo)
+
+    # Falta de ')' o ']' antes de '{' o ';' (println!("x" ;  /  if (a { ...)
+    for esperado, simbolo in (('PARENDER', ')'), ('CORCHDER', ']')):
+        if esperado in acciones and p.type in ('PUNTOCOMA', 'LLAVEIZQ') and flujo.inserciones < MAX_INSERCIONES:
+            _agregar_error_sintactico(fin_previo, f"Se esperaba '{simbolo}'.")
+            flujo.inserciones += 1
+            flujo.pendientes.insert(0, p)
+            parser.errok()
+            return _token_inventado(esperado, simbolo, fin_previo)
+
+    valor = p.value if p.type != 'STRING' else f'"{p.value}"'
+    _agregar_error_sintactico(p.lexpos, f"Token inesperado '{valor}'.")
+
 
 parser = yacc.yacc()
 
@@ -472,5 +626,6 @@ def parsear(codigo):
     # Ver que se detecten todos los errores lexicos del archivo
     errores_lex = escanear_errores_lexicos(codigo)
     lexer.lineno = 1
-    resultado = parser.parse(codigo, lexer=lexer, tracking=True)
+    flujo.reset()
+    resultado = parser.parse(codigo, lexer=flujo, tracking=True)
     return resultado, errores_parseo, errores_lex, lineas_nodo, columnas_nodo

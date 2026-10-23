@@ -169,7 +169,7 @@ def t_COMMENT_BLOCK(t):
 def t_COMMENT_BLOCK_SIN_CERRAR(t):
     r'/\*(.|\n)*'
     columna = encontrar_columna(t.lexer.lexdata, t.lexpos)
-    agregar_error_lexico(t.lineno, columna, "Comentario de bloque sin cerrar (falta '*/').")
+    agregar_error_lexico(t.lineno, columna, "Comentario de bloque sin cerrar.")
     t.lexer.lineno += t.value.count('\n')
 
 # CONTADOR DE LINEAS
@@ -180,7 +180,7 @@ def t_newline(t):
 # MANEJO DE ERRORES
 def t_error(t):
     columna = encontrar_columna(t.lexer.lexdata, t.lexpos)
-    agregar_error_lexico(t.lineno, columna, f"Caracter no reconocido '{t.value[0]}'.")
+    agregar_error_lexico(t.lineno, columna, f"Carácter no reconocido '{t.value[0]}'.")
     t.lexer.skip(1)
 
 # CREAR EL LEXER
