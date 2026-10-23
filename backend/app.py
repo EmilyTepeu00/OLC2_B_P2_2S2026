@@ -131,18 +131,25 @@ def ejecutar():
 
             # AST (nodos aplanados + imagen con Graphviz)
             ast_nodes = generar_nodos_ast(ast)
-            ast_image = generar_ast(ast_nodes)
+            try:
+                ast_image = generar_ast(ast_nodes)
+            except Exception:
+                ast_image = ''  # sin Graphviz instalado no se rompe la compilacion
 
             # GENERACION DE CODIGO ARM64 Y EJECUCION CON QEMU
-            # solo si el programa quedo 100% limpio hasta aqui
-            if not errores_totales:
-                generador = GeneradorCodigo()
-                codigo_arm64, errores_codegen = generador.generar(ast)
-                errores_totales += errores_codegen
+            # Resiliencia: los errores se reportan pero el programa se compila y ejecuta igual
+            # Las sentencias con errores (variable/funcion no declarada, indice fuera de rango...) se omiten y las operaciones con tipos incompatibles producen None
+            generador = GeneradorCodigo()
+            codigo_arm64, errores_codegen = generador.generar(ast, omitir=analizador.sentencias_omitidas)
+            errores_totales += errores_codegen
 
-                if codigo_arm64 is not None and not errores_codegen:
-                    salida, tiempo, errores_ejecucion = compilar_y_ejecutar(codigo_arm64)
-                    errores_totales += errores_ejecucion
+            if codigo_arm64:
+                salida, tiempo, errores_ejecucion = compilar_y_ejecutar(codigo_arm64)
+                errores_totales += errores_ejecucion
+            codigo_arm64 = codigo_arm64 or ''
+
+        # Orden de aparicion en el archivo (los que no tienen linea van al final)
+        errores_totales.sort(key=lambda e: (e.get('linea') or 10**9, e.get('columna') or 0))
 
         # Cada error trae un campo 'formato' con el texto de dos lineas
         for e in errores_totales:
@@ -223,7 +230,7 @@ def generar_tabla_simbolos(analizador):
                     'no': counter,
                     'nombre': nombre,
                     'categoria': 'Variable',
-                    'tipo': simbolo.tipo_dato or '—',
+                    'tipo': simbolo.tipo_texto or simbolo.tipo_dato or '—',
                     'ambito': ambito,
                     'linea': simbolo.linea if simbolo.linea else '—',
                     'valor': valor
@@ -234,7 +241,7 @@ def generar_tabla_simbolos(analizador):
                     'no': counter,
                     'nombre': nombre,
                     'categoria': 'Funcion',
-                    'tipo': simbolo.tipo_retorno or '—',
+                    'tipo': simbolo.tipo_texto or simbolo.tipo_retorno or '—',
                     'ambito': ambito,
                     'linea': simbolo.linea if simbolo.linea else '—',
                     'valor': '—'
