@@ -64,7 +64,7 @@ export default function App() {
   )
 
   useEffect(() => {
-    document.title = `OxigenScript`
+    document.title = `OxigenNative`
   }, [])
 
   const handleScrollSync = () => {
@@ -134,7 +134,7 @@ export default function App() {
   const handleEjecutar = async () => {
     setIsRunning(true)
     setConsoleLines([])
-    appendConsole('info', '> Ejecutando OxigenScript...')
+    appendConsole('info', '> Compilando OxigenNative a ARM64 y ejecutando con QEMU...')
 
     try {
       const res = await fetch(API_URL, {
@@ -179,7 +179,7 @@ export default function App() {
     <div className="app">
       <header className="toolbar">
         <div className="brand">
-          <span className="brand__name">OxigenScript</span>
+          <span className="brand__name">OxigenNative</span>
         </div>
 
         <div className="toolbar__actions">
@@ -208,7 +208,7 @@ export default function App() {
           <section className="editor" aria-label="Editor de codigo">
             <div className="panel__label">
               <span>Editor</span>
-              <span className="panel__label-sub">OxigenScript · {lineCount} lineas</span>
+              <span className="panel__label-sub">OxigenNative · {lineCount} lineas</span>
             </div>
             <div className="editor__body">
               <div className="editor__gutter" ref={gutterRef}>
